@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="img/logo.png" alt="dont-get-rusty logo" width="420">
+</p>
+
 # dont-get-rusty
 
 A local coding agent whose model-generated code runs only inside a WebAssembly
