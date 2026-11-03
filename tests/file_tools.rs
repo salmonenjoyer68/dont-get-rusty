@@ -12,6 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use async_trait::async_trait;
 use dont_get_rusty::agent::{Agent, AgentConfig, non_interactive_pause};
 use dont_get_rusty::assets::RuntimeImage;
+use dont_get_rusty::audit::AuditLog;
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::{
     Chat, ChatResponse, Choice, LlmError, Message, ResponseMessage, ToolCall,
@@ -26,6 +27,11 @@ static SANDBOX: LazyLock<Arc<Sandbox>> = LazyLock::new(|| {
         RuntimeImage::discover().expect("runtime image missing: run `scripts/fetch-assets.sh`");
     Arc::new(Sandbox::new(image.root()).expect("failed to create sandbox"))
 });
+
+/// Holds the Audit Log directory for the whole test binary, outside every
+/// temporary Workspace.
+static AUDIT_DIR: LazyLock<TempDir> =
+    LazyLock::new(|| TempDir::new().expect("audit directory should exist"));
 
 struct FakeChat {
     replies: Mutex<VecDeque<ChatResponse>>,
@@ -101,12 +107,15 @@ fn tool_contents(messages: &[Message]) -> Vec<String> {
 }
 
 fn agent(chat: Arc<FakeChat>, workspace: Workspace) -> Agent {
+    let audit =
+        AuditLog::open(AUDIT_DIR.path(), workspace.root_path()).expect("audit log should open");
     Agent::new(
         chat,
         SANDBOX.clone(),
         workspace,
         AgentConfig::default(),
         Policy::default(),
+        audit,
         non_interactive_pause(),
     )
 }

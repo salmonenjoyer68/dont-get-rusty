@@ -104,6 +104,7 @@ fn output_flood_is_truncated_per_stream() {
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert!(!result.timed_out);
+    assert!(result.truncated, "the discarded bytes are reported");
 
     // 200 * 100_000 bytes per stream; the first 64 KiB is retained.
     let discarded = 20_000_000 - 64 * 1024;

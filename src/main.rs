@@ -8,6 +8,7 @@ use anyhow::Context;
 use clap::Parser;
 use dont_get_rusty::agent::{Agent, PausePrompt};
 use dont_get_rusty::assets::RuntimeImage;
+use dont_get_rusty::audit::AuditLog;
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::OpenAiClient;
 use dont_get_rusty::policy::Policy;
@@ -69,6 +70,11 @@ async fn run_agent(
     ensure_policy_outside_workspace(policy_file.as_deref(), &workspace_root)?;
     let workspace = Workspace::open_with_quota(&workspace_root, policy.workspace_quota_bytes())
         .with_context(|| format!("failed to open workspace `{}`", workspace_root.display()))?;
+    // The Audit Log lives under the working directory, outside the Workspace;
+    // opening it fails rather than writing a log the model could read.
+    let cwd = std::env::current_dir().context("failed to read the working directory")?;
+    let audit = AuditLog::open(&cwd, workspace.root_path())
+        .context("refusing to start without an Audit Log outside the Workspace")?;
 
     let config = policy.agent_config();
     let sandbox = Arc::new(
@@ -83,6 +89,7 @@ async fn run_agent(
         workspace,
         config,
         policy,
+        audit,
         pause_prompt(yes),
     );
 
