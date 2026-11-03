@@ -10,9 +10,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 use async_trait::async_trait;
 use dont_get_rusty::agent::{Agent, AgentConfig, AgentError, AgentResult, SYSTEM_PROMPT};
 use dont_get_rusty::assets::RuntimeImage;
+use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::{
     Chat, ChatResponse, Choice, LlmError, Message, ResponseMessage, ToolCall,
 };
+use dont_get_rusty::policy::Policy;
 use dont_get_rusty::sandbox::Sandbox;
 use serde_json::{Value, json};
 
@@ -98,11 +100,13 @@ fn assistant_tool_calls(messages: &[Message]) -> Option<Vec<ToolCall>> {
 }
 
 fn agent(chat: Arc<FakeChat>, workspace: &tempfile::TempDir) -> Agent {
+    let workspace = Workspace::open(workspace.path()).expect("workspace should open");
     Agent::new(
         chat,
         SANDBOX.clone(),
-        workspace.path(),
+        workspace,
         AgentConfig::default(),
+        Policy::default(),
     )
 }
 
@@ -134,8 +138,21 @@ async fn batched_calls_execute_in_request_order_before_the_next_llm_call() {
 
     let requests = chat.requests();
     assert_eq!(requests.len(), 2, "one LLM call per Step");
-    assert_eq!(requests[0].tools.len(), 1, "only run_code is advertised");
-    assert_eq!(requests[0].tools[0]["function"]["name"], "run_code");
+    assert_eq!(
+        requests[0].tools.len(),
+        4,
+        "the complete tool surface is advertised"
+    );
+    let names: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["run_code", "read_file", "write_file", "list_files"],
+        "tool order is stable"
+    );
     assert!(matches!(
         &requests[0].messages[0],
         Message::System { content } if content == SYSTEM_PROMPT
@@ -219,7 +236,7 @@ async fn invalid_arguments_and_unknown_tools_become_observations_and_the_loop_co
             None,
             vec![
                 ToolCall::new("bad", "run_code", "{not json"),
-                ToolCall::new("", "read_file", "{}"),
+                ToolCall::new("", "delete_file", "{}"),
             ],
         ),
         reply(Some("recovered"), Vec::new()),
@@ -242,7 +259,7 @@ async fn invalid_arguments_and_unknown_tools_become_observations_and_the_loop_co
         observations[0].1
     );
     assert!(
-        observations[1].1.contains("unknown tool `read_file`"),
+        observations[1].1.contains("unknown tool `delete_file`"),
         "unknown tool observation: {}",
         observations[1].1
     );

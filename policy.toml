@@ -1,0 +1,20 @@
+[sandbox]
+memory_mb = 256
+timeout_s = 10
+max_output_kb = 64
+network = false
+
+[fs]
+root = "./workspace"
+max_total_mb = 50
+confirm_overwrite = true
+
+[agent]
+max_steps = 25
+max_failed_runs = 3
+context_budget_chars = 16000
+
+[llm]
+base_url = "http://localhost:11434/v1"
+model = "qwen3.5:4b"  # upgrade: qwen2.5-coder:7b after `ollama pull`
+request_timeout_s = 120

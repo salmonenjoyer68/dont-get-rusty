@@ -6,15 +6,17 @@
 //! request. The loop ends when a reply carries no `tool_calls` (the final
 //! answer) or when the configured Step limit is reached.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+use crate::fs::{Workspace, format_listing};
 use crate::llm::{Chat, LlmError, Message, ToolCall};
+use crate::policy::{Decision, Policy};
 use crate::sandbox::{RunResult, Sandbox};
-use crate::tools::{self, RunCodeArgs};
+use crate::tools::{self, ListFilesArgs, ReadFileArgs, RunCodeArgs, WriteFileArgs};
 
 /// The v1 system prompt, verbatim from `docs/design.md` § System Prompt.
 pub const SYSTEM_PROMPT: &str = "\
@@ -30,9 +32,9 @@ a WebAssembly sandbox with no network and a restricted workspace folder.
 
 /// Host-side limits for one [`Agent::run`].
 ///
-/// `max_failed_runs`, `context_budget_chars`, `base_url`, and `model` are
-/// carried here for the Policy wiring and later tickets; the v1 loop itself
-/// only enforces `max_steps`.
+/// Built from the Policy's `[agent]` and `[llm]` sections. The v1 loop
+/// enforces `max_steps`; `max_failed_runs` and `context_budget_chars` are
+/// carried for the tickets that add the pause prompt and compaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     /// Maximum number of Steps before the loop stops.
@@ -64,8 +66,11 @@ impl Default for AgentConfig {
 
 /// The host-produced result of one Tool Call, as fed back to the model.
 ///
-/// Fields other than [`Observation::tool`] are `None`/zero for an error
-/// Observation (invalid arguments, unknown tool, Sandbox setup failure).
+/// `exit_code` is `Some` only for a completed Guest Run; host file tools and
+/// error Observations carry `None`. An error Observation (invalid arguments,
+/// unknown tool, Policy denial, Workspace quota or escape failure, Sandbox
+/// setup failure) has a message in [`Observation::error`] and the loop
+/// continues.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation {
     /// Name of the tool that was called.
@@ -123,6 +128,25 @@ impl Observation {
             stderr_bytes: 0,
             first_stderr_line: None,
             error: Some(message.into()),
+        }
+    }
+
+    /// Builds an Observation for a host file tool's text output
+    /// (`read_file`, `write_file`, `list_files`). There is no Guest Run, so the
+    /// exit code is `None` and the byte count is the captured stdout length.
+    pub fn from_text(tool: impl Into<String>, output: impl Into<String>) -> Self {
+        let stdout = output.into();
+        Self {
+            tool: tool.into(),
+            exit_code: None,
+            stdout_bytes: stdout.len() as u64,
+            stdout,
+            stderr: String::new(),
+            timed_out: false,
+            duration_ms: 0,
+            stderr_bytes: 0,
+            first_stderr_line: None,
+            error: None,
         }
     }
 
@@ -186,35 +210,40 @@ pub struct AgentResult {
     pub steps: usize,
 }
 
-/// Drives one task through the LLM and the Sandbox.
+/// Drives one task through the LLM, the Workspace, and the Sandbox.
 pub struct Agent {
     chat: Arc<dyn Chat>,
     sandbox: Arc<Sandbox>,
-    workspace: PathBuf,
+    workspace: Workspace,
     config: AgentConfig,
+    policy: Policy,
 }
 
 impl Agent {
-    /// Uses `chat` for LLM turns, `sandbox` for `run_code`, and `workspace`
-    /// as the read-only `/workspace` preopen.
+    /// Uses `chat` for LLM turns, `sandbox` for `run_code`, `workspace` for
+    /// the file tools and the Guest's read-only `/workspace` preopen, and
+    /// `policy` for the `[agent]`/`[llm]` settings already resolved into
+    /// `config` plus every Tool Call decision.
     pub fn new(
         chat: Arc<dyn Chat>,
         sandbox: Arc<Sandbox>,
-        workspace: impl Into<PathBuf>,
+        workspace: Workspace,
         config: AgentConfig,
+        policy: Policy,
     ) -> Self {
         Self {
             chat,
             sandbox,
-            workspace: workspace.into(),
+            workspace,
             config,
+            policy,
         }
     }
 
     /// Runs `task` until the model answers or the Step limit is reached.
     pub async fn run(&self, task: &str) -> Result<AgentResult, AgentError> {
         let mut messages = vec![Message::system(SYSTEM_PROMPT), Message::user(task)];
-        let tools = vec![tools::run_code_tool()];
+        let tools = tools::tool_definitions();
 
         for step in 0..self.config.max_steps {
             let response = self.chat.chat(&messages, &tools).await?;
@@ -256,28 +285,34 @@ impl Agent {
         })
     }
 
-    /// Executes one Tool Call. Only `run_code` is wired in v1; every failure
-    /// becomes an Observation and never aborts the loop.
-    ///
-    /// The Sandbox drives its own Tokio runtime internally, so a Run must not
-    /// happen on an async worker thread: it runs on the blocking pool.
+    /// Executes one Tool Call. Every Tool Call passes through
+    /// [`Policy::check`] and every failure becomes an Observation, so the loop
+    /// never aborts on a denial or a Tool error.
     async fn execute(&self, call: &ToolCall) -> Observation {
-        if call.function.name != "run_code" {
-            return Observation::error(
-                call.function.name.clone(),
-                format!("unknown tool `{}`", call.function.name),
-            );
+        match call.function.name.as_str() {
+            "run_code" => self.run_code(call).await,
+            "read_file" => self.read_file(call),
+            "write_file" => self.write_file(call),
+            "list_files" => self.list_files(call),
+            other => self
+                .denied(other, None)
+                .unwrap_or_else(|| Observation::error(other, format!("unknown tool `{other}`"))),
+        }
+    }
+
+    /// Runs the Guest on the blocking pool; the Sandbox drives its own Tokio
+    /// runtime internally, so a Run must not happen on an async worker thread.
+    async fn run_code(&self, call: &ToolCall) -> Observation {
+        let args: RunCodeArgs = match parse_args("run_code", call) {
+            Ok(args) => args,
+            Err(error) => return *error,
+        };
+        if let Some(denied) = self.denied("run_code", None) {
+            return denied;
         }
 
-        let args: RunCodeArgs = match serde_json::from_str(&call.function.arguments) {
-            Ok(args) => args,
-            Err(error) => {
-                return Observation::error("run_code", format!("invalid arguments: {error}"));
-            }
-        };
-
         let sandbox = Arc::clone(&self.sandbox);
-        let workspace = self.workspace.clone();
+        let workspace = self.workspace.root_path().to_path_buf();
         let result = tokio::task::spawn_blocking(move || {
             sandbox.run(&args.code, args.stdin.as_deref(), Some(&workspace))
         })
@@ -294,4 +329,80 @@ impl Agent {
             ),
         }
     }
+
+    /// Reads one Workspace file. The bytes are decoded lossily for the model;
+    /// the reported byte count is the captured text.
+    fn read_file(&self, call: &ToolCall) -> Observation {
+        let args: ReadFileArgs = match parse_args("read_file", call) {
+            Ok(args) => args,
+            Err(error) => return *error,
+        };
+        if let Some(denied) = self.denied("read_file", Some(&args.path)) {
+            return denied;
+        }
+        match self.workspace.read_file(&args.path) {
+            Ok(bytes) => Observation::from_text("read_file", String::from_utf8_lossy(&bytes)),
+            Err(error) => Observation::error("read_file", error.to_string()),
+        }
+    }
+
+    /// Writes one Workspace file through the `cap-std` handle, so the quota
+    /// and containment checks run before anything is created or truncated.
+    /// Overwrite confirmation is ticket #8; `confirm_overwrite` is parsed but
+    /// not consulted yet.
+    fn write_file(&self, call: &ToolCall) -> Observation {
+        let args: WriteFileArgs = match parse_args("write_file", call) {
+            Ok(args) => args,
+            Err(error) => return *error,
+        };
+        if let Some(denied) = self.denied("write_file", Some(&args.path)) {
+            return denied;
+        }
+        match self
+            .workspace
+            .write_file(&args.path, args.content.as_bytes())
+        {
+            Ok(info) => Observation::from_text(
+                "write_file",
+                format!("wrote {} bytes to {}", info.bytes_written, args.path),
+            ),
+            Err(error) => Observation::error("write_file", error.to_string()),
+        }
+    }
+
+    /// Lists a Workspace directory in the stable `kind<TAB>size<TAB>name`
+    /// format; `None` lists the Workspace root.
+    fn list_files(&self, call: &ToolCall) -> Observation {
+        let args: ListFilesArgs = match parse_args("list_files", call) {
+            Ok(args) => args,
+            Err(error) => return *error,
+        };
+        let path = args.path.as_deref();
+        if let Some(denied) = self.denied("list_files", path) {
+            return denied;
+        }
+        match self.workspace.list_files(path.map(std::path::Path::new)) {
+            Ok(entries) => Observation::from_text("list_files", format_listing(&entries)),
+            Err(error) => Observation::error("list_files", error.to_string()),
+        }
+    }
+
+    /// Consults the Policy and renders a denial as an error Observation.
+    fn denied(&self, tool: &str, path: Option<&str>) -> Option<Observation> {
+        match self.policy.check(tool, path) {
+            Decision::Allow => None,
+            Decision::Deny { reason } => Some(Observation::error(tool, reason)),
+        }
+    }
+}
+
+/// Parses a Tool Call's arguments, turning malformed ones into a boxed error
+/// Observation named after `tool`.
+fn parse_args<T: DeserializeOwned>(tool: &str, call: &ToolCall) -> Result<T, Box<Observation>> {
+    serde_json::from_str(&call.function.arguments).map_err(|error| {
+        Box::new(Observation::error(
+            tool,
+            format!("invalid arguments: {error}"),
+        ))
+    })
 }

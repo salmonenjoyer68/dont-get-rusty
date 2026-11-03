@@ -183,6 +183,7 @@ fn resolve_target(path: &Path) -> Result<PathBuf, FsError> {
 /// The host-side Workspace capability.
 pub struct Workspace {
     root: Dir,
+    path: PathBuf,
     quota: u64,
 }
 
@@ -194,10 +195,19 @@ impl Workspace {
 
     /// Opens `root` as a Workspace with an explicit total-size quota.
     pub fn open_with_quota(root: impl AsRef<Path>, quota: u64) -> Result<Self, FsError> {
+        let path = root.as_ref().to_path_buf();
         Ok(Self {
-            root: Dir::open_ambient_dir(root, ambient_authority())?,
+            root: Dir::open_ambient_dir(&path, ambient_authority())?,
+            path,
             quota,
         })
+    }
+
+    /// The host path this Workspace was opened from, used for the Guest's
+    /// read-only `/workspace` preopen. Model-supplied paths are never resolved
+    /// against it; they stay relative to the capability.
+    pub fn root_path(&self) -> &Path {
+        &self.path
     }
 
     /// The configured quota in bytes.

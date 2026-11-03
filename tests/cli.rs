@@ -66,3 +66,92 @@ fn creates_a_missing_workspace_directory() {
 
     assert!(workspace.is_dir(), "workspace was not created");
 }
+
+/// Waits until `workspace` exists, then kills the child so the test never
+/// depends on a running model or a compiled Sandbox.
+fn create_workspace_then_stop(mut child: std::process::Child, workspace: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !workspace.is_dir() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn a_missing_policy_file_fails_with_a_clear_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("absent-policy.toml");
+    let output = binary()
+        .arg("say hello")
+        .arg("--policy")
+        .arg(&missing)
+        .env("DGR_ASSETS", dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains(missing.to_str().unwrap()),
+        "stderr names the file: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not exist"),
+        "stderr explains it: {stderr}"
+    );
+}
+
+#[test]
+fn the_workspace_flag_overrides_the_policy_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("policy.toml");
+    let policy_root = dir.path().join("policy-workspace");
+    let flag_root = dir.path().join("flag-workspace");
+    std::fs::write(
+        &policy,
+        format!("[fs]\nroot = \"{}\"\n", policy_root.display()),
+    )
+    .unwrap();
+
+    let child = binary()
+        .arg("say hello")
+        .arg("--policy")
+        .arg(&policy)
+        .arg("--workspace")
+        .arg(&flag_root)
+        .spawn()
+        .unwrap();
+    create_workspace_then_stop(child, &flag_root);
+
+    assert!(flag_root.is_dir(), "the flag directory was created");
+    assert!(
+        !policy_root.exists(),
+        "the policy root is not created when --workspace is given"
+    );
+}
+
+#[test]
+fn a_policy_file_inside_the_workspace_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let policy = workspace.join("policy.toml");
+    std::fs::write(&policy, "").unwrap();
+
+    let output = binary()
+        .arg("say hello")
+        .arg("--policy")
+        .arg(&policy)
+        .arg("--workspace")
+        .arg(&workspace)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("inside the Workspace"), "stderr: {stderr}");
+}
