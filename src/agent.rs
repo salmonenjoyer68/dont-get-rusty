@@ -404,8 +404,13 @@ impl Agent {
     ///
     /// The decision is made once, here, from the raw arguments, so every Tool
     /// Call has a recorded verdict even when its arguments are malformed or its
-    /// name is unknown. A denial becomes an error Observation; an Audit write
-    /// failure ends the loop instead of dropping the event.
+    /// name is unknown. A Policy allow whose execution fails (quota, escape,
+    /// overwrite decline, malformed arguments, Sandbox setup) is recorded as a
+    /// denial with the error as the reason, so the log never says `allow` for
+    /// something that did not happen. A completed Guest Run stays `allow` even
+    /// with a non-zero exit code: the Guest ran, and the exit code records the
+    /// outcome. A denial becomes an error Observation; an Audit write failure
+    /// ends the loop instead of dropping the event.
     async fn execute(&self, call: &ToolCall, step: usize) -> Result<Observation, AgentError> {
         let started = Instant::now();
         let decision = self.decide(call);
@@ -415,9 +420,15 @@ impl Agent {
                 Observation::error(call.function.name.as_str(), reason.clone())
             }
         };
+        // A Tool Call that was allowed to run but failed is audited as a
+        // denial: nothing crossed the boundary, and the error says why.
+        let recorded = match (&decision, observation.error.as_deref()) {
+            (Decision::Allow, Some(reason)) => Decision::deny(reason),
+            _ => decision.clone(),
+        };
         let duration_ms = started.elapsed().as_millis() as u64;
         self.audit
-            .record(step, call, &decision, &observation, duration_ms)?;
+            .record(step, call, &recorded, &observation, duration_ms)?;
         Ok(observation)
     }
 

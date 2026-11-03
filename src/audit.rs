@@ -7,12 +7,20 @@
 //! cannot reach it.
 //!
 //! The log proves what crossed the boundary without duplicating it. The
-//! `code` and `content` argument fields are replaced by an
+//! `code`, `content`, and `stdin` argument fields are replaced by an
 //! `<omitted: N bytes>` marker *before* the arguments are shortened to
 //! [`MAX_ARGS_PREFIX`] bytes, and `args_sha256` hashes the full raw argument
 //! string, so an event can be matched against the payload it describes. A
 //! payload that is not a JSON object is not stored at all, for the same
-//! reason: nothing in it can be identified and redacted.
+//! reason: nothing in it can be identified and redacted. Piped `stdin` is
+//! redacted too: it is model-supplied data crossing the boundary, not
+//! metadata.
+//!
+//! `decision` is `deny` both for a Policy refusal and for a Tool Call that
+//! was allowed to run but failed on the host (quota, escape, overwrite
+//! decline, malformed arguments, Sandbox setup); `denial_reason` carries the
+//! error. A Guest Run always records `allow`, even when its exit code is
+//! non-zero: the Guest ran, and its exit code is the recorded result.
 //!
 //! Each event is one synchronous append followed by a flush, so a crash keeps
 //! every completed event and at worst loses the one in flight. A write failure
@@ -41,14 +49,18 @@ pub const FILE: &str = "audit.jsonl";
 /// Maximum number of argument bytes kept in [`AuditEvent::args_prefix`].
 pub const MAX_ARGS_PREFIX: usize = 2 * 1024;
 
-/// Argument fields that carry code or file bodies and are never stored.
-const REDACTED_FIELDS: [&str; 2] = ["code", "content"];
+/// Argument fields that carry code, file bodies, or piped input and are never
+/// stored.
+const REDACTED_FIELDS: [&str; 3] = ["code", "content", "stdin"];
 
 /// One Audit Event: what was called, what the Policy decided, what it did.
 ///
-/// Field order is the serialized line order. `denial_reason` is absent for
-/// allowed calls; `exit_code` is `null` for the host file tools and for error
-/// Observations, matching [`Observation::exit_code`].
+/// Field order is the serialized line order. `decision` is `deny` for a
+/// Policy refusal and for a host-side execution failure; `denial_reason` is
+/// absent only when the call was allowed and produced a non-error result
+/// (including a Guest Run with a non-zero exit code). `exit_code` is `null`
+/// for the host file tools and for error Observations, matching
+/// [`Observation::exit_code`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuditEvent {
     /// RFC 3339 UTC timestamp of the host write.
@@ -247,10 +259,11 @@ fn sha256_hex(text: &str) -> String {
 
 /// The argument prefix stored in an event.
 ///
-/// Code and file bodies are replaced by a byte-count marker before the prefix
-/// is cut, so no amount of truncation can expose them; `args_sha256` still
-/// covers the full payload. A payload that is not a JSON object is reduced to
-/// its length, because its fields cannot be identified and redacted.
+/// Code, file bodies, and piped stdin are replaced by a byte-count marker
+/// before the prefix is cut, so no amount of truncation can expose them;
+/// `args_sha256` still covers the full payload. A payload that is not a JSON
+/// object is reduced to its length, because its fields cannot be identified
+/// and redacted.
 fn args_prefix(arguments: &str) -> String {
     let redacted = match serde_json::from_str::<serde_json::Value>(arguments) {
         Ok(serde_json::Value::Object(mut object)) => {

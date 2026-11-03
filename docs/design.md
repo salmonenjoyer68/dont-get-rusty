@@ -52,7 +52,7 @@ User → CLI/TUI → Agent Loop → LLM client (local HTTP)
 | JavaScript | quickjs-ng 0.18.0, p1 | Post-v1. 1.5 MB wasm, no preopens needed for `-e`; `Lang` stays extensible. |
 | Rust | Not in v1 | Would need `rustc` to wasm32-wasip1; run compile step on host in a locked-down way, or skip. |
 
-Assets are fetched by `scripts/fetch-assets.sh` from pinned release URLs into a gitignored `assets/` (SHA-256 verified). Startup re-verifies; a missing or mismatched asset refuses to run with the fix command. Pre-compile with `Module::serialize` and cache under `.agent/cache/`, keyed by wasm hash + Wasmtime version.
+Assets are fetched by `scripts/fetch-assets.sh` from pinned release URLs into a gitignored `assets/` (SHA-256 verified). Startup re-verifies; a missing or mismatched asset refuses to run with the fix command. Wasmtime's on-disk module cache (`Config::cache` with a directory) caches the compiled Guest under `<cwd>/.agent/cache/`, keyed by the wasm bytes and the Wasmtime version; the safe cache is used instead of unsafe `Module::deserialize`.
 
 ## Sandbox Limits (defaults)
 
@@ -205,7 +205,9 @@ Append-only JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Gues
 {"ts":"2026-11-03T12:00:00Z","session":"…","step":3,"tool":"write_file","args_sha256":"…","args_prefix":"…","decision":"allow","exit_code":null,"stdout_bytes":0,"stderr_bytes":0,"truncated":false,"duration_ms":4}
 ```
 
-Args are truncated to 2 KiB plus a SHA-256 of the full payload; code and file contents are never stored.
+Args are truncated to 2 KiB plus a SHA-256 of the full payload; code, file contents, and piped `stdin` are never stored.
+
+`decision` is `deny` for a Policy refusal and for a call the Policy allowed but that failed on the host (quota, escape, overwrite decline, malformed arguments, Sandbox setup), with the error as `denial_reason`. A Guest Run records `allow` even when its exit code is non-zero: the Guest ran, and the exit code is the result.
 
 ## Tests
 

@@ -1,5 +1,7 @@
 //! CLI wiring: one-shot `dont-get-rusty "task"`.
 
+#![forbid(unsafe_code)]
+
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,11 +10,11 @@ use anyhow::Context;
 use clap::Parser;
 use dont_get_rusty::agent::{Agent, OverwritePrompt, PausePrompt};
 use dont_get_rusty::assets::RuntimeImage;
-use dont_get_rusty::audit::AuditLog;
+use dont_get_rusty::audit::{AuditLog, DIR as AGENT_DIR};
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::OpenAiClient;
 use dont_get_rusty::policy::Policy;
-use dont_get_rusty::sandbox::Sandbox;
+use dont_get_rusty::sandbox::{CACHE_DIR, Sandbox};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -77,9 +79,13 @@ async fn run_agent(
         .context("refusing to start without an Audit Log outside the Workspace")?;
 
     let config = policy.agent_config();
+    // The compiled Guest module is cached under `<cwd>/.agent/cache`, keyed by
+    // the wasm hash and the Wasmtime version, so startup does not pay the full
+    // compile cost every time. The directory sits outside the Workspace.
+    let mut sandbox_cfg = policy.sandbox_cfg();
+    sandbox_cfg.cache_dir = Some(cwd.join(AGENT_DIR).join(CACHE_DIR));
     let sandbox = Arc::new(
-        Sandbox::with_cfg(image.root(), policy.sandbox_cfg())
-            .context("failed to initialize the Sandbox")?,
+        Sandbox::with_cfg(image.root(), sandbox_cfg).context("failed to initialize the Sandbox")?,
     );
     let client = OpenAiClient::new(&config.base_url, &config.model, config.request_timeout)
         .context("failed to build the LLM client")?;
