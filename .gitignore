@@ -1,0 +1,7 @@
+/target/
+/assets/
+/workspace/
+/.agent/
+/.scratch/
+/.worktrees/
+*.cwasm
