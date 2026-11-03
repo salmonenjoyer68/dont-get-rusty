@@ -153,7 +153,7 @@ loop {
 Rules:
 
 - Max 25 steps, where a step is one LLM turn; every tool call in that turn executes in order.
-- A failed run is `run_code` returning a non-zero `exit_code` (including traps). Three consecutive failed runs pause the loop; the CLI asks `continue? [y/N]`. Yes resets the counter; no, or a non-interactive session, ends the session with the last stderr.
+- A failed run is `run_code` returning a non-zero `exit_code` (including traps). Three consecutive failed runs pause the loop; the CLI asks `continue? [y/N]`. Yes resets the counter; no, or a non-interactive session, ends the session with the last stderr. `--yes` answers the pause with yes, so unattended runs never block on it.
 - A policy denial becomes an error observation; it never aborts the loop.
 - The agent must run its code before claiming it works.
 - `write_file` prompts only when the target existed before the session; agent-created files overwrite silently. `--yes` disables prompts; without a TTY a required confirmation becomes a denial observation.

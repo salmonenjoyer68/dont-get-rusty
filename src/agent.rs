@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::context::{self, Entry};
 use crate::llm::{Chat, LlmError, Message, ToolCall};
 use crate::sandbox::{RunResult, Sandbox};
 use crate::tools::{self, RunCodeArgs};
@@ -30,16 +31,18 @@ a WebAssembly sandbox with no network and a restricted workspace folder.
 
 /// Host-side limits for one [`Agent::run`].
 ///
-/// `max_failed_runs`, `context_budget_chars`, `base_url`, and `model` are
-/// carried here for the Policy wiring and later tickets; the v1 loop itself
-/// only enforces `max_steps`.
+/// `base_url` and `model` are carried here for the Policy wiring and the LLM
+/// client; `max_steps`, `max_failed_runs`, and `context_budget_chars` are
+/// enforced by the loop itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     /// Maximum number of Steps before the loop stops.
     pub max_steps: usize,
-    /// Consecutive failed `run_code` Runs that pause the loop (ticket #6).
+    /// Consecutive failed `run_code` Runs that pause the loop; zero disables
+    /// the pause.
     pub max_failed_runs: usize,
-    /// Character budget for the conversation before compaction (ticket #6).
+    /// Character budget for the conversation before compaction; see
+    /// [`crate::context::compact`] for exactly what counts.
     pub context_budget_chars: usize,
     /// OpenAI-compatible API root, including the version segment.
     pub base_url: String,
@@ -175,6 +178,9 @@ pub enum AgentError {
     /// The loop used every allowed Step without a reply lacking tool calls.
     #[error("step limit reached: {max_steps} Steps without a final answer")]
     StepLimit { max_steps: usize },
+    /// Consecutive `run_code` Runs failed and the user declined to continue.
+    #[error("stopped after {failed_runs} consecutive failed Runs; last stderr:\n{stderr}")]
+    FailedRuns { failed_runs: usize, stderr: String },
 }
 
 /// A completed Agent Loop run.
@@ -186,38 +192,64 @@ pub struct AgentResult {
     pub steps: usize,
 }
 
+/// Decides whether the Loop continues after
+/// [`AgentConfig::max_failed_runs`] consecutive failed Runs.
+///
+/// The argument is the last failed Run's stderr. Returning `true` resets the
+/// failure counter and lets the loop continue; `false` ends it with
+/// [`AgentError::FailedRuns`].
+pub type PausePrompt = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// The safe default for a session without a terminal: never continue.
+pub fn non_interactive_pause() -> PausePrompt {
+    Arc::new(|_last_stderr| false)
+}
+
 /// Drives one task through the LLM and the Sandbox.
 pub struct Agent {
     chat: Arc<dyn Chat>,
     sandbox: Arc<Sandbox>,
     workspace: PathBuf,
     config: AgentConfig,
+    pause: PausePrompt,
 }
 
 impl Agent {
     /// Uses `chat` for LLM turns, `sandbox` for `run_code`, and `workspace`
     /// as the read-only `/workspace` preopen.
+    ///
+    /// `pause` is asked before every further Step once
+    /// [`AgentConfig::max_failed_runs`] consecutive Runs have failed; pass
+    /// [`non_interactive_pause`] when no user can answer.
     pub fn new(
         chat: Arc<dyn Chat>,
         sandbox: Arc<Sandbox>,
         workspace: impl Into<PathBuf>,
         config: AgentConfig,
+        pause: PausePrompt,
     ) -> Self {
         Self {
             chat,
             sandbox,
             workspace: workspace.into(),
             config,
+            pause,
         }
     }
 
     /// Runs `task` until the model answers or the Step limit is reached.
     pub async fn run(&self, task: &str) -> Result<AgentResult, AgentError> {
-        let mut messages = vec![Message::system(SYSTEM_PROMPT), Message::user(task)];
+        let mut conversation = vec![
+            Entry::Message(Message::system(SYSTEM_PROMPT)),
+            Entry::Message(Message::user(task)),
+        ];
         let tools = vec![tools::run_code_tool()];
+        let mut failed_runs = 0usize;
 
         for step in 0..self.config.max_steps {
-            let response = self.chat.chat(&messages, &tools).await?;
+            // The full conversation is kept; only the request view is compacted.
+            let request = context::compact(&conversation, self.config.context_budget_chars);
+            let response = self.chat.chat(&request, &tools).await?;
             let choice = response
                 .choices
                 .into_iter()
@@ -241,13 +273,42 @@ impl Agent {
                 }
             }
 
-            messages.push(Message::assistant(content, tool_calls.clone()));
+            conversation.push(Entry::Message(Message::assistant(
+                content,
+                tool_calls.clone(),
+            )));
 
             // Every Observation must be in the conversation before the next
             // LLM call.
             for call in &tool_calls {
                 let observation = self.execute(call).await;
-                messages.push(Message::tool(call.id.clone(), observation.to_content()));
+
+                // A failed Run is a `run_code` with a non-zero exit code,
+                // including traps and timeouts. Error Observations have no
+                // exit code: they neither count nor reset the counter.
+                if let Some(exit_code) = observation.exit_code {
+                    if exit_code == 0 {
+                        failed_runs = 0;
+                    } else {
+                        failed_runs += 1;
+                        if self.config.max_failed_runs > 0
+                            && failed_runs >= self.config.max_failed_runs
+                        {
+                            if !(self.pause)(&observation.stderr) {
+                                return Err(AgentError::FailedRuns {
+                                    failed_runs,
+                                    stderr: observation.stderr,
+                                });
+                            }
+                            failed_runs = 0;
+                        }
+                    }
+                }
+
+                conversation.push(Entry::Observation {
+                    tool_call_id: call.id.clone(),
+                    observation,
+                });
             }
         }
 
