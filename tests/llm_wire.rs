@@ -329,7 +329,7 @@ async fn connection_errors_surface_as_connect() {
 }
 
 #[tokio::test]
-async fn timeout_is_retried_once() {
+async fn timeout_is_not_retried() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let accepts = Arc::new(AtomicUsize::new(0));
@@ -354,8 +354,12 @@ async fn timeout_is_retried_once() {
         .chat(&[Message::user("go")], &tool_definitions())
         .await
         .unwrap_err();
-    assert!(matches!(error, LlmError::Connect(_)), "{error:?}");
-    assert_eq!(accepts.load(Ordering::SeqCst), 2, "timeout must retry once");
+    assert!(matches!(error, LlmError::Request(_)), "{error:?}");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "a request timeout is not retried"
+    );
 }
 
 struct FakeChat;

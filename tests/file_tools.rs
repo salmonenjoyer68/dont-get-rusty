@@ -180,7 +180,9 @@ async fn writes_then_reads_through_the_workspace() {
     assert!(read.contains("exit_code: none"), "read: {read}");
     assert!(read.contains("stdout_bytes: 5"), "read: {read}");
     assert!(
-        read.contains("--- begin stdout (5 bytes) ---\nhello--- end stdout ---\n"),
+        read.contains(
+            "--- begin stdout (5 bytes total; 5 bytes shown) ---\nhello--- end stdout ---\n"
+        ),
         "read: {read}"
     );
 }
@@ -206,7 +208,7 @@ async fn list_output_uses_the_stable_line_format() {
     assert_eq!(contents.len(), 2);
     assert!(
         contents[0].contains(
-            "--- begin stdout (21 bytes) ---\n\
+            "--- begin stdout (21 bytes total; 21 bytes shown) ---\n\
              file\t2\ta.txt\n\
              dir\t-\tb\n\
              --- end stdout ---\n"
@@ -216,7 +218,7 @@ async fn list_output_uses_the_stable_line_format() {
     );
     assert!(
         contents[1].contains(
-            "--- begin stdout (13 bytes) ---\n\
+            "--- begin stdout (13 bytes total; 13 bytes shown) ---\n\
              file\t1\tc.txt\n\
              --- end stdout ---\n"
         ),
@@ -527,7 +529,7 @@ async fn a_quota_denied_overwrite_never_reaches_the_confirmation() {
 }
 
 #[tokio::test]
-async fn a_confirmed_overwrite_owns_the_path_for_the_rest_of_the_session() {
+async fn a_preexisting_file_prompts_on_every_overwrite() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("notes.txt"), "original").unwrap();
     let chat = FakeChat::new(vec![
@@ -549,7 +551,7 @@ async fn a_confirmed_overwrite_owns_the_path_for_the_rest_of_the_session() {
     );
     assert_eq!(
         *prompts.lock().unwrap(),
-        vec!["notes.txt"],
-        "a confirmed path is a session file and later writes are silent"
+        vec!["notes.txt", "notes.txt"],
+        "a file that existed before the session is not an agent-created session file"
     );
 }

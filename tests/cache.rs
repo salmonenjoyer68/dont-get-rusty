@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use dont_get_rusty::assets::RuntimeImage;
-use dont_get_rusty::sandbox::{RunResult, Sandbox, SandboxCfg, SandboxError};
+use dont_get_rusty::sandbox::{Lang, RunResult, Sandbox, SandboxCfg, SandboxError};
 
 fn runtime_image() -> RuntimeImage {
     RuntimeImage::discover().expect("runtime image missing: run `scripts/fetch-assets.sh`")
@@ -50,7 +50,7 @@ fn the_compiled_module_is_cached_and_a_second_sandbox_reuses_it() {
     let first = Sandbox::with_cfg(image.root(), cached_cfg(&cache))
         .expect("a missing cache directory is created, not an error");
     let result: RunResult = first
-        .run("print('cached')", None, None)
+        .run(Lang::Python, "print('cached')", None, None)
         .expect("guest run should not fail at the host level");
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "cached\n");
@@ -81,7 +81,7 @@ fn the_compiled_module_is_cached_and_a_second_sandbox_reuses_it() {
     let second = Sandbox::with_cfg(image.root(), cached_cfg(&cache))
         .expect("the cached artifact should load");
     let result = second
-        .run("print('reused')", None, None)
+        .run(Lang::Python, "print('reused')", None, None)
         .expect("guest run should not fail at the host level");
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "reused\n");

@@ -1,9 +1,9 @@
 //! Deterministic context compaction for the Agent Loop.
 //!
-//! Before every LLM call the loop sends a *compacted view* of its
-//! conversation instead of the conversation itself, so a long session cannot
-//! overflow the model's context window. Compaction is pure: it never calls the
-//! model, never writes, and returns the same output for the same input.
+//! Before every LLM call the loop sends a *compacted view* of its history
+//! instead of the history itself, so a long session cannot overflow the
+//! model's context window. Compaction is pure: it never calls the model, never
+//! writes, and returns the same output for the same input.
 //!
 //! # What counts toward the budget
 //!
@@ -35,16 +35,21 @@
 //!    exit code, stdout/stderr byte counts, first stderr line, and — for a
 //!    failed Tool Call — its host-side error message;
 //! 4. stubs keep being emitted after the budget is spent.
+//!
+//! Compaction is monotonic: once an Observation is stubbed or truncated, every
+//! *older* Observation is stubbed too, even when it would still fit the
+//! remaining budget. Newer Observations therefore always have at least as much
+//! detail as older ones.
 
 use crate::agent::Observation;
 use crate::llm::Message;
 
-/// One conversation entry as the Agent Loop holds it.
+/// One history entry as the Agent Loop holds it.
 ///
 /// Only Observations may be rewritten by [`compact`]; every other message is
 /// passed through unchanged, byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Entry {
+pub enum HistoryEntry {
     /// A message compaction must not touch: the system prompt, the task, or an
     /// assistant reply (including its `tool_calls`).
     Message(Message),
@@ -58,12 +63,12 @@ pub enum Entry {
 /// Returns the messages to send as one LLM request.
 ///
 /// See the module documentation for the budget rules.
-pub fn compact(entries: &[Entry], budget_chars: usize) -> Vec<Message> {
+pub fn compact(entries: &[HistoryEntry], budget_chars: usize) -> Vec<Message> {
     let fixed_chars: usize = entries
         .iter()
         .map(|entry| match entry {
-            Entry::Message(message) => message_chars(message),
-            Entry::Observation { .. } => 0,
+            HistoryEntry::Message(message) => message_chars(message),
+            HistoryEntry::Observation { .. } => 0,
         })
         .sum();
 
@@ -71,8 +76,8 @@ pub fn compact(entries: &[Entry], budget_chars: usize) -> Vec<Message> {
         .iter()
         .enumerate()
         .filter_map(|(index, entry)| match entry {
-            Entry::Observation { .. } => Some(index),
-            Entry::Message(_) => None,
+            HistoryEntry::Observation { .. } => Some(index),
+            HistoryEntry::Message(_) => None,
         })
         .collect();
     let newest = observation_indices.last().copied();
@@ -80,35 +85,40 @@ pub fn compact(entries: &[Entry], budget_chars: usize) -> Vec<Message> {
     let mut contents: Vec<Option<String>> = entries
         .iter()
         .map(|entry| match entry {
-            Entry::Observation { observation, .. } => Some(observation.to_content()),
-            Entry::Message(_) => None,
+            HistoryEntry::Observation { observation, .. } => Some(observation.to_content()),
+            HistoryEntry::Message(_) => None,
         })
         .collect();
 
     let mut remaining = budget_chars.saturating_sub(fixed_chars);
+    // Set once a newer Observation could not be sent verbatim; every older one
+    // must then be stubbed, keeping detail monotonic with recency.
+    let mut spent = false;
 
     for &index in observation_indices.iter().rev() {
         let content = contents[index]
             .take()
             .expect("an Observation entry always has rendered content");
         let length = content.chars().count();
-        if length <= remaining {
+        if !spent && length <= remaining {
             remaining -= length;
             contents[index] = Some(content);
             continue;
         }
 
-        if Some(index) == newest {
+        if !spent && Some(index) == newest {
             contents[index] = Some(head_and_tail(&content, remaining));
             remaining = 0;
+            spent = true;
             continue;
         }
 
-        let Entry::Observation { observation, .. } = &entries[index] else {
+        let HistoryEntry::Observation { observation, .. } = &entries[index] else {
             unreachable!("the observation index came from an Observation entry");
         };
         let stub = stub(observation, length);
         remaining = remaining.saturating_sub(stub.chars().count());
+        spent = true;
         contents[index] = Some(stub);
     }
 
@@ -116,8 +126,8 @@ pub fn compact(entries: &[Entry], budget_chars: usize) -> Vec<Message> {
         .iter()
         .zip(contents)
         .map(|(entry, content)| match entry {
-            Entry::Message(message) => message.clone(),
-            Entry::Observation { tool_call_id, .. } => Message::tool(
+            HistoryEntry::Message(message) => message.clone(),
+            HistoryEntry::Observation { tool_call_id, .. } => Message::tool(
                 tool_call_id.clone(),
                 content.expect("every Observation entry was assigned content"),
             ),

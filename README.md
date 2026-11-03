@@ -17,9 +17,12 @@ Requires a Rust toolchain (edition 2024).
    ```
 
    This downloads the CPython 3.15.2 WASI build (`python.wasm` plus
-   `lib/python3.15/`) into the gitignored `assets/`, verifies its SHA-256, and
-   writes `assets/checksums.txt`. Startup re-verifies the hash and refuses to
-   run with the fetch command in the error if the image is missing or corrupt.
+   `lib/python3.15/`) into the gitignored `assets/`, verifies the archive
+   SHA-256, and writes `assets/checksums.txt` with a SHA-256 for every file in
+   the image. Startup verifies the whole image against that file (and
+   `python.wasm` against its embedded pin) and refuses to run, naming the
+   mismatched file and the fetch command, if the image or its checksums are
+   missing or corrupt.
 
 2. Point `[llm].base_url` at your local OpenAI-compatible server (Ollama's
    default is `http://localhost:11434/v1`). The default model is
@@ -28,6 +31,9 @@ Requires a Rust toolchain (edition 2024).
 
 Wasmtime is pinned to **50.0.1**: the WASI preview 1 API and the socket stubs
 are version-specific.
+
+Set `DGR_ASSETS=<dir>` to use a Runtime Image outside this repository (the CLI
+tests do this; a deployment can keep the image in a read-only location).
 
 ## Usage
 
@@ -78,8 +84,9 @@ would exceed it creates and truncates nothing.
 - The compiled Guest module is cached under `<cwd>/.agent/cache`, keyed by the
   wasm bytes and the Wasmtime version, so a warm start does not pay the ~1.3 s
   compile. An unusable cache directory is a clear setup error, never a panic.
-- Assets are hash-verified at startup; a tampered or missing `python.wasm` is
-  refused before anything runs.
+- The whole Runtime Image is hash-verified at startup from the image's
+  `checksums.txt`; a tampered or missing file (including a stdlib file)
+  is refused before anything runs.
 
 ## Audit
 
@@ -90,10 +97,12 @@ full arguments, the redacted argument prefix, the decision, exit code, output
 byte counts, truncation flag, and duration. `code`, `content`, and `stdin` are
 replaced by `<omitted: N bytes>` markers, so bodies never reach the log.
 
-`decision` is `deny` for a Policy refusal and for a call the Policy allowed but
-that failed on the host (quota, escape, overwrite decline, malformed arguments,
-Sandbox setup), with the error as `denial_reason`. A Guest Run is `allow` even
-when its exit code is non-zero.
+`decision`/`denial_reason` are the Policy verdict only. A call the Policy
+allowed but that failed on the host (quota, escape, overwrite decline,
+malformed arguments, Sandbox setup) stays `allow` and records the host-side
+message in the optional `error` field; a Policy denial carries `denial_reason`
+and no `error`. A Guest Run is `allow` even when its exit code is non-zero.
+Output byte counts are totals produced before truncation.
 
 ## Tests
 

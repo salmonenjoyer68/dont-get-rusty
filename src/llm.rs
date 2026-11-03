@@ -20,10 +20,11 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// A failure to obtain a model reply.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LlmError {
-    /// Connection setup failed or the deadline expired; retried once.
+    /// Connection setup failed; retried once.
     #[error("connection error: {0}")]
     Connect(String),
-    /// Another transport failure, such as reading the response body.
+    /// Another transport failure, such as the deadline expiring while waiting
+    /// for the response or reading its body; never retried.
     #[error("request error: {0}")]
     Request(String),
     /// A non-2xx response; the server's body is preserved verbatim.
@@ -207,8 +208,9 @@ impl OpenAiClient {
         })
     }
 
-    /// Sends the conversation and tool schemas, retrying at most once on a
-    /// connection error, timeout, or 5xx. 4xx is surfaced verbatim.
+    /// Sends the messages and tool schemas, retrying at most once on a
+    /// connection error or 5xx. A timeout, another transport failure, or 4xx is
+    /// surfaced without a retry.
     pub async fn chat(
         &self,
         messages: &[Message],
@@ -234,7 +236,9 @@ impl OpenAiClient {
             .send()
             .await
             .map_err(|error| {
-                if error.is_connect() || error.is_timeout() {
+                // Only connection setup is retried. A request timeout is a
+                // slow model, not a broken link: retrying doubles the wait.
+                if error.is_connect() {
                     LlmError::Connect(error.to_string())
                 } else {
                     LlmError::Request(error.to_string())

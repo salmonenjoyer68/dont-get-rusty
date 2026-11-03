@@ -326,7 +326,7 @@ async fn run_code_observations_reflect_real_guest_execution() {
     assert!(content.contains("timed_out: false"), "content: {content}");
     assert!(content.contains("stdout_bytes: 2"), "content: {content}");
     assert!(
-        content.contains("--- begin stdout (2 bytes) ---\n5\n"),
+        content.contains("--- begin stdout (2 bytes total; 2 bytes shown) ---\n5\n"),
         "content: {content}"
     );
 }

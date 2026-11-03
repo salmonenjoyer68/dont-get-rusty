@@ -46,6 +46,11 @@ fn a_tampered_runtime_image_is_refused_at_startup() {
     let assets = dir.path().join("assets");
     std::fs::create_dir_all(assets.join("lib/python3.15")).unwrap();
     std::fs::write(assets.join("python.wasm"), b"not the pinned guest").unwrap();
+    std::fs::write(
+        assets.join("checksums.txt"),
+        format!("{}  python.wasm\n", "0".repeat(64)),
+    )
+    .unwrap();
 
     let output = binary()
         .arg("say hello")

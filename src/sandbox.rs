@@ -69,17 +69,46 @@ impl SandboxCfg {
     }
 }
 
+/// The language runtime a Run executes.
+///
+/// v1 ships only [`Lang::Python`]; the enum keeps the interpreter choice out of
+/// the call sites so a later Guest does not change the Sandbox API. It selects
+/// the program name and argv prefix, not the compiled module (the Sandbox still
+/// compiles `python.wasm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    /// CPython, invoked as `python.wasm -u -c <code>`.
+    Python,
+}
+
+impl Lang {
+    /// The program name the Guest sees in `argv[0]`.
+    fn program(self) -> &'static str {
+        match self {
+            Self::Python => "python.wasm",
+        }
+    }
+}
+
 /// How one Run ended, as seen by the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunResult {
     pub exit_code: i32,
+    /// Output retained for the model; when [`RunResult::truncated`] is set, the
+    /// stream ends with a marker naming the discarded bytes.
     pub stdout: String,
+    /// Output retained for the model; when [`RunResult::truncated`] is set, the
+    /// stream ends with a marker naming the discarded bytes.
     pub stderr: String,
     pub timed_out: bool,
     /// Whether the capture limit discarded bytes from stdout or stderr; the
     /// affected stream ends with a truncation marker.
     pub truncated: bool,
     pub duration_ms: u64,
+    /// Total stdout bytes the Guest produced, before capture truncation.
+    pub stdout_bytes: u64,
+    /// Total stderr bytes the Guest produced, before capture truncation.
+    pub stderr_bytes: u64,
 }
 
 /// A failure to set up the Sandbox, as opposed to a Guest failure.
@@ -213,7 +242,8 @@ impl Sandbox {
         })
     }
 
-    /// Runs `code` as `python.wasm -u -c <code>` in a fresh Sandbox.
+    /// Runs `code` as [`Lang`]'s interpreter with `-u -c <code>` in a fresh
+    /// Sandbox.
     ///
     /// The Guest sees the Runtime Image read-only at `/` and, when `workspace`
     /// is given, the Workspace read-only at `/workspace`. It gets no
@@ -221,6 +251,7 @@ impl Sandbox {
     /// host-mediated through [`crate::fs::Workspace`].
     pub fn run(
         &self,
+        lang: Lang,
         code: &str,
         stdin: Option<&str>,
         workspace: Option<&Path>,
@@ -231,7 +262,7 @@ impl Sandbox {
         let wasi = {
             let mut builder = WasiCtxBuilder::new();
             builder
-                .args(&["python.wasm", "-u", "-c", code])
+                .args(&[lang.program(), "-u", "-c", code])
                 .stdout(stdout.clone())
                 .stderr(stderr.clone())
                 .preopened_dir(&self.runtime_image, "/", FsPerms::ReadOnly)?;
@@ -327,6 +358,8 @@ impl Sandbox {
             timed_out,
             truncated: stdout_truncated || stderr_truncated,
             duration_ms,
+            stdout_bytes: stdout_total,
+            stderr_bytes: stderr_total,
         })
     }
 }

@@ -15,7 +15,7 @@ use dont_get_rusty::agent::{
 };
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::audit::AuditLog;
-use dont_get_rusty::context::{Entry, compact};
+use dont_get_rusty::context::{HistoryEntry, compact};
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::{
     Chat, ChatResponse, Choice, LlmError, Message, ResponseMessage, ToolCall,
@@ -102,6 +102,8 @@ fn observation(exit_code: i32, stdout: &str, stderr: &str) -> Observation {
             timed_out: false,
             truncated: false,
             duration_ms: 7,
+            stdout_bytes: stdout.len() as u64,
+            stderr_bytes: stderr.len() as u64,
         },
     )
 }
@@ -139,16 +141,16 @@ fn assistant_tool_calls(messages: &[Message]) -> Option<Vec<ToolCall>> {
     })
 }
 
-fn conversation(old: Observation, new: Observation) -> Vec<Entry> {
+fn history(old: Observation, new: Observation) -> Vec<HistoryEntry> {
     vec![
-        Entry::Message(Message::system("system")),
-        Entry::Message(Message::user("task")),
-        Entry::Message(Message::assistant(None, vec![call("old"), call("new")])),
-        Entry::Observation {
+        HistoryEntry::Message(Message::system("system")),
+        HistoryEntry::Message(Message::user("task")),
+        HistoryEntry::Message(Message::assistant(None, vec![call("old"), call("new")])),
+        HistoryEntry::Observation {
             tool_call_id: "old".to_owned(),
             observation: old,
         },
-        Entry::Observation {
+        HistoryEntry::Observation {
             tool_call_id: "new".to_owned(),
             observation: new,
         },
@@ -160,7 +162,7 @@ fn the_newest_observation_stays_verbatim_and_older_ones_are_stubbed() {
     let old = observation(1, "old stdout", "old stderr");
     let new = observation(0, "new stdout", "");
     let new_text = new.to_content();
-    let entries = conversation(old, new);
+    let entries = history(old, new);
     let fixed = "system".chars().count() + "task".chars().count();
     let budget = fixed + new_text.chars().count() + 200;
 
@@ -203,13 +205,68 @@ fn the_newest_observation_stays_verbatim_and_older_ones_are_stubbed() {
 }
 
 #[test]
+fn compaction_is_monotonic_once_a_newer_observation_is_stubbed() {
+    let newest = observation(0, "new stdout", "");
+    let middle = observation(0, &"m".repeat(2_000), "");
+    let oldest = observation(0, "oldest stdout", "");
+    let newest_text = newest.to_content();
+    let oldest_text = oldest.to_content();
+    let entries = vec![
+        HistoryEntry::Message(Message::system("system")),
+        HistoryEntry::Message(Message::user("task")),
+        HistoryEntry::Message(Message::assistant(
+            None,
+            vec![call("oldest"), call("middle"), call("newest")],
+        )),
+        HistoryEntry::Observation {
+            tool_call_id: "oldest".to_owned(),
+            observation: oldest,
+        },
+        HistoryEntry::Observation {
+            tool_call_id: "middle".to_owned(),
+            observation: middle,
+        },
+        HistoryEntry::Observation {
+            tool_call_id: "newest".to_owned(),
+            observation: newest,
+        },
+    ];
+    let fixed = "system".chars().count() + "task".chars().count();
+    // The newest fits verbatim, the middle does not, and the small oldest would
+    // still fit in the budget left after the middle's stub. Monotonic
+    // compaction must stub it anyway because a newer Observation was stubbed.
+    let budget = fixed + newest_text.chars().count() + 600;
+
+    let messages = compact(&entries, budget);
+
+    assert_eq!(
+        tool_content(&messages, "newest"),
+        newest_text,
+        "the newest Observation stays verbatim"
+    );
+    assert!(
+        tool_content(&messages, "middle").contains("compacted Observation"),
+        "the oversized middle Observation is stubbed"
+    );
+    let rendered_oldest = tool_content(&messages, "oldest");
+    assert!(
+        rendered_oldest.contains("compacted Observation"),
+        "an older Observation must not outlive a stubbed newer one: {rendered_oldest}"
+    );
+    assert_ne!(
+        rendered_oldest, oldest_text,
+        "the oldest Observation is not sent verbatim"
+    );
+}
+
+#[test]
 fn an_oversized_newest_observation_is_sent_head_and_tail_with_a_marker() {
     let huge = observation(0, &"x".repeat(5_000), "");
     let entries = vec![
-        Entry::Message(Message::system("system")),
-        Entry::Message(Message::user("task")),
-        Entry::Message(Message::assistant(None, vec![call("huge")])),
-        Entry::Observation {
+        HistoryEntry::Message(Message::system("system")),
+        HistoryEntry::Message(Message::user("task")),
+        HistoryEntry::Message(Message::assistant(None, vec![call("huge")])),
+        HistoryEntry::Observation {
             tool_call_id: "huge".to_owned(),
             observation: huge,
         },
@@ -232,14 +289,14 @@ fn an_oversized_newest_observation_is_sent_head_and_tail_with_a_marker() {
 #[test]
 fn a_budget_with_no_room_still_answers_every_tool_call() {
     let entries = vec![
-        Entry::Message(Message::system("system")),
-        Entry::Message(Message::user("task")),
-        Entry::Message(Message::assistant(None, vec![call("bad"), call("ok")])),
-        Entry::Observation {
+        HistoryEntry::Message(Message::system("system")),
+        HistoryEntry::Message(Message::user("task")),
+        HistoryEntry::Message(Message::assistant(None, vec![call("bad"), call("ok")])),
+        HistoryEntry::Observation {
             tool_call_id: "bad".to_owned(),
             observation: Observation::error("run_code", "invalid arguments: oops"),
         },
-        Entry::Observation {
+        HistoryEntry::Observation {
             tool_call_id: "ok".to_owned(),
             observation: observation(0, "fine", ""),
         },
@@ -273,14 +330,14 @@ fn a_budget_with_no_room_still_answers_every_tool_call() {
 }
 
 #[test]
-fn a_conversation_within_budget_is_returned_unchanged() {
+fn a_history_within_budget_is_returned_unchanged() {
     let only = observation(0, "fine", "");
     let text = only.to_content();
     let entries = vec![
-        Entry::Message(Message::system("system")),
-        Entry::Message(Message::user("task")),
-        Entry::Message(Message::assistant(None, vec![call("only")])),
-        Entry::Observation {
+        HistoryEntry::Message(Message::system("system")),
+        HistoryEntry::Message(Message::user("task")),
+        HistoryEntry::Message(Message::assistant(None, vec![call("only")])),
+        HistoryEntry::Observation {
             tool_call_id: "only".to_owned(),
             observation: only,
         },

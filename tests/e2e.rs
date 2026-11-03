@@ -270,6 +270,12 @@ fn one_run_writes_the_file_executes_the_guest_and_audits_each_call() {
         .map(|event| event["decision"].as_str().unwrap())
         .collect();
     assert_eq!(decisions, ["allow", "allow"]);
+    for event in &events {
+        assert!(
+            event.get("error").is_none(),
+            "neither call failed on the host: {audit}"
+        );
+    }
     assert_eq!(events[0]["exit_code"], Value::Null);
     assert_eq!(events[1]["exit_code"], json!(0));
     assert_eq!(events[1]["stderr_bytes"], json!(0));

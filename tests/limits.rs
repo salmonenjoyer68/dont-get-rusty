@@ -8,7 +8,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use dont_get_rusty::assets::RuntimeImage;
-use dont_get_rusty::sandbox::{RunResult, Sandbox, SandboxCfg};
+use dont_get_rusty::sandbox::{Lang, RunResult, Sandbox, SandboxCfg};
 
 /// A short deadline keeps the timeout test quick without changing any other
 /// limit. It is long enough that CPython startup plus a compute-heavy script
@@ -38,7 +38,7 @@ fn run(code: &str) -> RunResult {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     FAST_SANDBOX
-        .run(code, None, None)
+        .run(Lang::Python, code, None, None)
         .expect("guest run should not fail at the host level")
 }
 
@@ -105,6 +105,11 @@ fn output_flood_is_truncated_per_stream() {
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert!(!result.timed_out);
     assert!(result.truncated, "the discarded bytes are reported");
+    assert_eq!(
+        result.stdout_bytes, 20_000_000,
+        "the reported count is everything the Guest wrote, not what was kept"
+    );
+    assert_eq!(result.stderr_bytes, 20_000_000);
 
     // 200 * 100_000 bytes per stream; the first 64 KiB is retained.
     let discarded = 20_000_000 - 64 * 1024;
