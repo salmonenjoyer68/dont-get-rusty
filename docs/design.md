@@ -37,11 +37,11 @@ User → CLI/TUI → Agent Loop → LLM client (local HTTP)
 | HTTP to LLM | `reqwest` (rustls, json, stream) |
 | Serialization | `serde`, `serde_json`, `toml` |
 | Tool schemas | `schemars` |
-| Sandboxed FS | `cap-std` ≥ 4.0.3 (host tools only; blocks `..` and symlink escapes) |
+| Sandboxed FS | `cap-std` ≥ 4.0.3 (model-reachable paths only; blocks `..` and symlink escapes) |
 | CLI | `clap` |
 | TUI (later) | `ratatui`, `crossterm` |
 | Errors | `thiserror` (libs), `anyhow` (bin) |
-| Logging/audit | `tracing`, `tracing-subscriber`, JSONL writer |
+| Audit | hand-written JSONL (`serde_json`), RFC 3339 timestamps from `time` |
 | Tests | built-in `#[test]`, `tempfile`, `proptest` for path fuzzing |
 
 ## Guest Runtimes (compiled to wasm32-wasip1, run inside Wasmtime)
@@ -52,16 +52,16 @@ User → CLI/TUI → Agent Loop → LLM client (local HTTP)
 | JavaScript | quickjs-ng 0.18.0, p1 | Post-v1. 1.5 MB wasm, no preopens needed for `-e`; `Lang` stays extensible. |
 | Rust | Not in v1 | Would need `rustc` to wasm32-wasip1; run compile step on host in a locked-down way, or skip. |
 
-Assets are fetched by `scripts/fetch-assets.sh` from pinned release URLs into a gitignored `assets/` (SHA-256 verified). Startup re-verifies; a missing or mismatched asset refuses to run with the fix command. Pre-compile with `Module::serialize` and cache under `.agent/cache/`, keyed by wasm hash + Wasmtime version.
+Assets are fetched by `scripts/fetch-assets.sh` from pinned release URLs into a gitignored `assets/`; the script verifies the archive SHA-256 and writes `checksums.txt` listing a SHA-256 for every file in the image (`python.wasm` plus all of `lib/python3.15/**`, image-relative paths). Startup reads `checksums.txt`, requires and verifies `python.wasm` and every listed file, and refuses — naming the mismatched file and the fix command — when a file is missing, a hash differs, or the checksums file is missing or corrupt. `python.wasm` also has an embedded pin, so a tampered checksums file cannot bless a tampered Guest. The whole tree is hashed once per startup. The default root is `./assets/` (falling back to the crate's assets directory); `DGR_ASSETS=<dir>` overrides it for tests and for deployments that keep the image elsewhere. Wasmtime's on-disk module cache (`Config::cache` with a directory) caches the compiled Guest under `<cwd>/.agent/cache/`, keyed by the wasm bytes and the Wasmtime version; the safe cache is used instead of unsafe `Module::deserialize`.
 
 ## Sandbox Limits (defaults)
 
-- Memory: 256 MB via `StoreLimitsBuilder::memory_size` (CPython's linear memory starts at 40 MiB; the cap is per linear memory)
+- Memory: 256 MB via a `MemoryLimiter` that delegates to `StoreLimitsBuilder::memory_size` for every other limit. A `memory.grow` past the cap returns an error from `ResourceLimiter::memory_growing`, which Wasmtime turns into a trap the host maps to exit 137; a plain `StoreLimits` denial would surface as an ordinary Python `MemoryError` (exit 1). CPython's linear memory starts at 40 MiB, so smaller caps fail at instantiation; the cap is per linear memory.
 - CPU: epoch interruption (`Config::epoch_interruption(true)`) with a ticker thread; 10 s wall-clock timeout. Fuel is not used: an open Wasmtime bug (PR #14647) loses accounting when fuel and epoch are combined, and v1 needs no deterministic cap.
 - Output: stdout/stderr captured through a custom `OutputStream` that retains 64 KB per stream, drains and counts the remainder, and appends `[sandbox: output truncated; N bytes discarded]`; retained bytes decoded with `from_utf8_lossy`
 - Filesystem: Guest gets a read-only preopen of the runtime dist at `/` (stdlib) and of `./workspace` at `/workspace`; all durable writes go through host tools (`cap-std`); 50 MB total quota enforced host-side
 - Network: p1 sockets must be linked (CPython imports `sock_*`); `add_to_linker_sync` registers all of them and in 50.0.1 they are nonfunctional stubs. `WasiCtxBuilder` defaults deny TCP/UDP/DNS; omitting the imports makes CPython fail at instantiation.
-- Env/args: no env; argv is the script path
+- Env/args: no env; argv is `python.wasm -u -c <code>`
 - Processes/threads: none
 
 Run termination:
@@ -78,7 +78,7 @@ Partial stdout is retained on every path. `duration_ms` spans instantiation thro
 ## Core Types
 
 ```rust
-// tools.rs
+// tools.rs: one typed argument struct per tool, parsed from the wire arguments
 #[derive(JsonSchema, Deserialize)]
 pub struct RunCodeArgs { pub code: String, pub stdin: Option<String> }
 // language is fixed to Python in v1; the tool schema does not expose it.
@@ -92,20 +92,30 @@ pub struct WriteFileArgs { pub path: String, pub content: String }
 #[derive(JsonSchema, Deserialize)]
 pub struct ListFilesArgs { pub path: Option<String> }
 
-pub enum ToolCall {
-    RunCode(RunCodeArgs),
-    ReadFile(ReadFileArgs),
-    WriteFile(WriteFileArgs),
-    ListFiles(ListFilesArgs),
+// llm.rs: the wire type, shared by request and response bodies. It carries a
+// tool name and raw JSON arguments; the Agent Loop dispatches on the name and
+// parses the arguments into the matching struct above. There is no typed
+// `ToolCall` enum in v1.
+pub struct ToolCall {
+    pub id: String,
+    pub kind: String,                 // "function"
+    pub function: FunctionCall,       // name + JSON-string arguments
 }
 
-#[derive(Serialize)]
+// sandbox.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang { Python }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunResult {
     pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: String,               // retained output, may be truncated
+    pub stderr: String,               // retained output, may be truncated
     pub timed_out: bool,
+    pub truncated: bool,
     pub duration_ms: u64,
+    pub stdout_bytes: u64,            // total produced, before truncation
+    pub stderr_bytes: u64,            // total produced, before truncation
 }
 ```
 
@@ -113,13 +123,30 @@ Tool schemas are generated with `schemars` and must stay flat: Ollama renders th
 
 ```rust
 // sandbox.rs (shape)
-pub struct Sandbox { engine: Engine, python: Module, cfg: SandboxCfg }
+pub struct Sandbox {
+    engine: Engine,
+    module: Module,
+    runtime_image: PathBuf,
+    cfg: SandboxCfg,
+}
 
 impl Sandbox {
-    pub fn new(cfg: SandboxCfg) -> Result<Self>;
-    pub async fn run(&self, lang: Lang, code: &str, stdin: Option<&str>, ws: &Dir) -> Result<RunResult>;
+    pub fn new(runtime_image: &Path) -> Result<Self>;
+    pub fn with_cfg(runtime_image: &Path, cfg: SandboxCfg) -> Result<Self>;
+    pub fn run(
+        &self,
+        lang: Lang,
+        code: &str,
+        stdin: Option<&str>,
+        workspace: Option<&Path>,
+    ) -> Result<RunResult, SandboxError>;
 }
 ```
+
+`Lang` selects the interpreter and argv (`python.wasm -u -c <code>`); v1 has only
+`Lang::Python`, and the Sandbox compiles that module once at construction. `run`
+is synchronous because the Agent Loop drives it from `spawn_blocking` (the
+Sandbox owns its own epoch ticker thread).
 
 Run flow inside `run`:
 
@@ -153,16 +180,16 @@ loop {
 Rules:
 
 - Max 25 steps, where a step is one LLM turn; every tool call in that turn executes in order.
-- A failed run is `run_code` returning a non-zero `exit_code` (including traps). Three consecutive failed runs pause the loop; the CLI asks `continue? [y/N]`. Yes resets the counter; no, or a non-interactive session, ends the session with the last stderr.
+- A failed run is `run_code` returning a non-zero `exit_code` (including traps). Three consecutive failed runs pause the loop; the CLI asks `continue? [y/N]`. Yes resets the counter; no, or a non-interactive session, ends the session with the last stderr. `--yes` answers the pause with yes, so unattended runs never block on it.
 - A policy denial becomes an error observation; it never aborts the loop.
 - The agent must run its code before claiming it works.
-- `write_file` prompts only when the target existed before the session; agent-created files overwrite silently. `--yes` disables prompts; without a TTY a required confirmation becomes a denial observation.
-- Two budgets: capture keeps 64 KB per stream; before each LLM call, compact the message list to `context_budget_chars` from policy — newest results verbatim until the budget is spent, older ones stubbed to `{tool, exit_code, stdout_bytes, first stderr line}`; a newest result that alone exceeds the budget is sent as head+tail with a marker. No LLM summarization.
+- `write_file` prompts only when the target existed before the session; a file the agent created this session overwrites silently. A pre-existing path prompts on *every* overwrite: only creation by the agent (`WriteInfo::existed == false`) makes a path a session path. `--yes` disables prompts; without a TTY a required confirmation becomes an error observation.
+- Two budgets: capture keeps 64 KB per stream; before each LLM call, compact the message list to `context_budget_chars` from policy — newest results verbatim until the budget is spent, older ones stubbed to `{tool, exit_code, stdout_bytes, first stderr line}`; a newest result that alone exceeds the budget is sent as head+tail with a marker. Compaction is monotonic: once a newer Observation is stubbed or truncated, every older Observation is stubbed too, even if it would still fit. No LLM summarization.
 - Invalid tool arguments become an error observation; the loop continues.
 
 ## LLM Client
 
-Non-streaming: one `/v1/chat/completions` request per Step, `tools` built from the `schemars` schemas, 120 s timeout, one retry on connection error or 5xx, 4xx surfaced verbatim. `base_url` and `model` come from policy; no capability preflight.
+Non-streaming: one `/v1/chat/completions` request per Step, `tools` built from the `schemars` schemas, 120 s timeout, one retry on a connection error or 5xx only. A request timeout is surfaced without a retry (it is a slow model, not a broken connection), and 4xx is surfaced verbatim. `base_url` and `model` come from policy; no capability preflight.
 
 ## CLI
 
@@ -195,15 +222,19 @@ request_timeout_s = 120
 
 `max_total_mb` is enforced before each `write_file` by summing workspace file sizes; a write that would exceed it is denied.
 
+Every value has a documented default, so a partial file is valid. `--policy <file>` must name an existing file; without it `./policy.toml` is loaded when present, otherwise the built-in defaults apply. Unknown keys are rejected so a typo cannot silently fall back to a weaker default. The Policy file must live outside the Workspace (startup refuses otherwise) so the model can neither read nor modify it. `network = true` is rejected: v1 grants the Guest no network capability.
+
 ## Audit
 
 Append-only JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Guest cannot read it. One event per Tool Call:
 
 ```json
-{"ts":"2026-11-03T12:00:00Z","session":"…","step":3,"tool":"write_file","args_sha256":"…","args_prefix":"…","decision":"allow","exit_code":null,"stdout_bytes":0,"stderr_bytes":0,"truncated":false,"duration_ms":4}
+{"ts":"2026-11-03T12:00:00Z","session":"…","step":3,"tool":"write_file","args_sha256":"…","args_prefix":"…","decision":"allow","error":"workspace quota exceeded: …","exit_code":null,"stdout_bytes":0,"stderr_bytes":0,"truncated":false,"duration_ms":4}
 ```
 
-Args are truncated to 2 KiB plus a SHA-256 of the full payload; code and file contents are never stored.
+Args are truncated to 2 KiB plus a SHA-256 of the full payload; code, file contents, and piped `stdin` are never stored.
+
+`decision`/`denial_reason` are the Policy verdict only: `deny` with a reason for a Policy refusal, `allow` otherwise. A call the Policy allowed but that failed on the host (quota, escape, overwrite decline, malformed arguments, Sandbox setup) stays `allow` and records the host-side message in the optional `error` field; a Policy denial has `denial_reason` and no `error`. A Guest Run records `allow` even when its exit code is non-zero: the Guest ran, and the exit code is the result. Output byte counts are totals produced before truncation.
 
 ## Tests
 
@@ -242,7 +273,7 @@ agent/
 │   └── fetch-assets.sh
 ├── assets/
 │   ├── python.wasm
-│   ├── python-stdlib/
+│   ├── lib/python3.15/
 │   └── checksums.txt
 ├── policy.toml
 ├── workspace/
@@ -265,7 +296,7 @@ agent/
 
 - [ ] `#![forbid(unsafe_code)]` in the agent crate
 - [ ] No `std::process::Command` on model output anywhere
-- [ ] All host file access goes through `cap-std` ≥ 4.0.3 `Dir`; the Guest preopen is read-only
+- [ ] All model-reachable host file access goes through `cap-std` ≥ 4.0.3 `Dir`; the Guest preopen is read-only. Host-controlled setup paths (Runtime Image verification, the Policy file, the Audit Log) use `std::fs`, because the model never supplies them
 - [ ] Traversal/symlink tests pass (proptest on paths)
 - [ ] `while True:` guest killed by epoch timeout
 - [ ] Memory bomb trapped cleanly, host unaffected

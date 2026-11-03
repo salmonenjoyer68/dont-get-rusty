@@ -1,7 +1,36 @@
+# Build output
 /target/
+*.cwasm
+
+# Fetched or generated runtime state (never commit the Guest image or audit log)
 /assets/
 /workspace/
 /.agent/
 /.scratch/
 /.worktrees/
-*.cwasm
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+*.secret
+*.secrets
+id_rsa*
+id_ed25519*
+.netrc
+.npmrc
+.pypirc
+/credentials.json
+/secrets.json
+
+# Local logs and editor state
+*.log
+.idea/
+.vscode/
+.DS_Store
