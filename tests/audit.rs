@@ -11,7 +11,9 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use dont_get_rusty::agent::{Agent, AgentConfig, Observation, non_interactive_pause};
+use dont_get_rusty::agent::{
+    Agent, AgentConfig, Observation, non_interactive_overwrite, non_interactive_pause,
+};
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::audit::{AuditError, AuditLog, MAX_ARGS_PREFIX};
 use dont_get_rusty::fs::Workspace;
@@ -339,6 +341,7 @@ async fn the_loop_records_one_event_per_tool_call_in_request_order() {
         Policy::default(),
         audit,
         non_interactive_pause(),
+        non_interactive_overwrite(),
     );
 
     assert_eq!(agent.run("audit every call").await.unwrap().answer, "done");

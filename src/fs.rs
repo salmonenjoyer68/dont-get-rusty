@@ -67,6 +67,9 @@ pub enum FsError {
     QuotaExceeded { projected: u64, limit: u64 },
     #[error("workspace tree is nested too deeply")]
     TooDeep,
+    /// An overwrite confirmation callback answered no; nothing was written.
+    #[error("overwrite of `{}` was not confirmed; the file was left unchanged", .0.display())]
+    OverwriteDeclined(PathBuf),
     /// `cap-std` failures, including escape denials (`PermissionDenied`).
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -226,6 +229,23 @@ impl Workspace {
     /// A denied write creates no directories and leaves an existing file
     /// intact. Overwriting counts as `total - old + new`.
     pub fn write_file(&self, path: impl AsRef<Path>, content: &[u8]) -> Result<WriteInfo, FsError> {
+        self.write_file_with_confirm(path, content, |_| true)
+    }
+
+    /// Writes `content`, enforcing the quota before touching the disk, and
+    /// asks `confirm` before overwriting an existing file.
+    ///
+    /// Every traversal, target-type, and quota check runs first. Only then is
+    /// `confirm` called with the Workspace-relative target; returning `false`
+    /// leaves the Workspace exactly as it was and yields
+    /// [`FsError::OverwriteDeclined`]. `confirm` is never called for a target
+    /// that did not exist, because creating a file destroys nothing.
+    pub fn write_file_with_confirm(
+        &self,
+        path: impl AsRef<Path>,
+        content: &[u8],
+        confirm: impl FnOnce(&Path) -> bool,
+    ) -> Result<WriteInfo, FsError> {
         let rel = resolve_target(path.as_ref())?;
 
         let total = self.total_size()?;
@@ -244,6 +264,12 @@ impl Workspace {
                 projected,
                 limit: self.quota,
             });
+        }
+
+        // Every check has passed; the confirmation runs before anything on
+        // disk is created or truncated.
+        if existing.is_some() && !confirm(&rel) {
+            return Err(FsError::OverwriteDeclined(rel));
         }
 
         // Only now is anything on disk created or truncated.
