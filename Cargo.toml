@@ -1,0 +1,50 @@
+[package]
+name = "dont-get-rusty"
+version = "0.1.0"
+edition = "2024"
+description = "A local coding agent that runs model-generated code inside a WebAssembly sandbox"
+license = "MIT"
+publish = false
+
+[lib]
+name = "dont_get_rusty"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dont-get-rusty"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+cap-std = "4.0.3"
+clap = { version = "4", features = ["derive"] }
+rand = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
+toml = "1"
+wasmtime = { version = "=50.0.1", default-features = false, features = [
+    "cranelift",
+    "runtime",
+    "std",
+    "cache",
+    "backtrace",
+    "demangle",
+] }
+wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p1"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+# Wasmtime's Cranelift compiles the 32 MB CPython module on every first Run.
+# Unoptimized Cranelift takes minutes per test binary; optimize dependencies
+# (not this crate) so the Sandbox tests stay quick.
+[profile.dev.package."*"]
+opt-level = 2
