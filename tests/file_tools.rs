@@ -10,7 +10,7 @@ use std::fs;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use dont_get_rusty::agent::{Agent, AgentConfig};
+use dont_get_rusty::agent::{Agent, AgentConfig, non_interactive_pause};
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::{
@@ -107,6 +107,7 @@ fn agent(chat: Arc<FakeChat>, workspace: Workspace) -> Agent {
         workspace,
         AgentConfig::default(),
         Policy::default(),
+        non_interactive_pause(),
     )
 }
 

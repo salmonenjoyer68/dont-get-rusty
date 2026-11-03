@@ -8,7 +8,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use dont_get_rusty::agent::{Agent, AgentConfig, AgentError, AgentResult, SYSTEM_PROMPT};
+use dont_get_rusty::agent::{
+    Agent, AgentConfig, AgentError, AgentResult, PausePrompt, SYSTEM_PROMPT, non_interactive_pause,
+};
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::{
@@ -100,13 +102,28 @@ fn assistant_tool_calls(messages: &[Message]) -> Option<Vec<ToolCall>> {
 }
 
 fn agent(chat: Arc<FakeChat>, workspace: &tempfile::TempDir) -> Agent {
+    agent_with(
+        chat,
+        workspace,
+        AgentConfig::default(),
+        non_interactive_pause(),
+    )
+}
+
+fn agent_with(
+    chat: Arc<FakeChat>,
+    workspace: &tempfile::TempDir,
+    config: AgentConfig,
+    pause: PausePrompt,
+) -> Agent {
     let workspace = Workspace::open(workspace.path()).expect("workspace should open");
     Agent::new(
         chat,
         SANDBOX.clone(),
         workspace,
-        AgentConfig::default(),
+        config,
         Policy::default(),
+        pause,
     )
 }
 
@@ -299,5 +316,161 @@ async fn run_code_observations_reflect_real_guest_execution() {
     assert!(
         content.contains("--- begin stdout (2 bytes) ---\n5\n"),
         "content: {content}"
+    );
+}
+
+/// A `run_code` that writes `boom` to stderr and exits non-zero.
+fn failing_run(id: &str) -> ToolCall {
+    run_code(id, "import sys; sys.stderr.write('boom\\n'); sys.exit(3)")
+}
+
+/// Records every pause prompt and answers with `answer`.
+fn recording_pause(answer: bool) -> (PausePrompt, Arc<Mutex<Vec<String>>>) {
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&prompts);
+    let pause: PausePrompt = Arc::new(move |last_stderr: &str| {
+        recorder.lock().unwrap().push(last_stderr.to_owned());
+        answer
+    });
+    (pause, prompts)
+}
+
+#[tokio::test]
+async fn three_consecutive_failed_runs_pause_once_and_yes_resets_the_counter() {
+    let chat = FakeChat::new(vec![
+        reply(None, vec![failing_run("f1")]),
+        reply(None, vec![failing_run("f2")]),
+        reply(None, vec![failing_run("f3")]),
+        reply(None, vec![failing_run("f4")]),
+        reply(Some("finished"), Vec::new()),
+    ]);
+    let (pause, prompts) = recording_pause(true);
+    let workspace = tempfile::tempdir().unwrap();
+    let result = agent_with(chat.clone(), &workspace, AgentConfig::default(), pause)
+        .run("fail repeatedly")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result,
+        AgentResult {
+            answer: "finished".to_owned(),
+            steps: 5,
+        }
+    );
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the counter reset after yes, so the fourth failure does not pause"
+    );
+    assert!(prompts[0].contains("boom"), "last stderr: {}", prompts[0]);
+    assert_eq!(chat.requests().len(), 5);
+}
+
+#[tokio::test]
+async fn declining_the_pause_ends_the_loop_with_the_last_stderr() {
+    let chat = FakeChat::new(vec![
+        reply(None, vec![failing_run("f1")]),
+        reply(None, vec![failing_run("f2")]),
+        reply(None, vec![failing_run("f3")]),
+        reply(Some("never reached"), Vec::new()),
+    ]);
+    let (pause, prompts) = recording_pause(false);
+    let workspace = tempfile::tempdir().unwrap();
+    let error = agent_with(chat.clone(), &workspace, AgentConfig::default(), pause)
+        .run("give up")
+        .await
+        .unwrap_err();
+
+    match error {
+        AgentError::FailedRuns {
+            failed_runs,
+            stderr,
+        } => {
+            assert_eq!(failed_runs, 3);
+            assert!(stderr.contains("boom"), "stderr: {stderr}");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(prompts.lock().unwrap().len(), 1);
+    assert_eq!(
+        chat.requests().len(),
+        3,
+        "no LLM call after the pause ended the loop"
+    );
+}
+
+#[tokio::test]
+async fn a_non_interactive_session_never_continues_after_repeated_failures() {
+    let chat = FakeChat::new(vec![
+        reply(None, vec![failing_run("f1")]),
+        reply(None, vec![failing_run("f2")]),
+        reply(None, vec![failing_run("f3")]),
+        reply(Some("never reached"), Vec::new()),
+    ]);
+    let workspace = tempfile::tempdir().unwrap();
+    let error = agent(chat.clone(), &workspace)
+        .run("no terminal")
+        .await
+        .unwrap_err();
+
+    match error {
+        AgentError::FailedRuns {
+            failed_runs,
+            stderr,
+        } => {
+            assert_eq!(failed_runs, 3);
+            assert!(stderr.contains("boom"), "stderr: {stderr}");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(chat.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn a_run_with_exit_zero_resets_the_failure_counter() {
+    let chat = FakeChat::new(vec![
+        reply(None, vec![failing_run("f1")]),
+        reply(None, vec![failing_run("f2")]),
+        reply(None, vec![run_code("ok", "print('fine')")]),
+        reply(None, vec![failing_run("f3")]),
+        reply(None, vec![failing_run("f4")]),
+        reply(Some("finished"), Vec::new()),
+    ]);
+    let (pause, prompts) = recording_pause(true);
+    let workspace = tempfile::tempdir().unwrap();
+    let result = agent_with(chat.clone(), &workspace, AgentConfig::default(), pause)
+        .run("succeed in between")
+        .await
+        .unwrap();
+
+    assert_eq!(result.answer, "finished");
+    assert_eq!(result.steps, 6);
+    assert!(
+        prompts.lock().unwrap().is_empty(),
+        "two failures, success, two failures never reaches the threshold"
+    );
+}
+
+#[tokio::test]
+async fn error_observations_do_not_count_as_failed_runs() {
+    let chat = FakeChat::new(vec![
+        reply(None, vec![ToolCall::new("bad", "run_code", "{not json")]),
+        reply(None, vec![ToolCall::new("unknown", "read_file", "{}")]),
+        reply(None, vec![ToolCall::new("missing", "run_code", "{}")]),
+        reply(Some("finished"), Vec::new()),
+    ]);
+    let (pause, prompts) = recording_pause(false);
+    let workspace = tempfile::tempdir().unwrap();
+    let result = agent_with(chat.clone(), &workspace, AgentConfig::default(), pause)
+        .run("break the tools")
+        .await
+        .unwrap();
+
+    assert_eq!(result.answer, "finished");
+    assert!(
+        prompts.lock().unwrap().is_empty(),
+        "invalid arguments and unknown tools are not failed Runs"
     );
 }

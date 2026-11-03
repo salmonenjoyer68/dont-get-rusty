@@ -1,7 +1,7 @@
 //! Run-limit and termination-mapping tests against the real CPython Guest.
 //!
 //! `scripts/fetch-assets.sh` must have run first. Most tests share one Sandbox
-//! with a 1 s deadline so the infinite-loop case stays fast; the production
+//! with a 5 s deadline so the infinite-loop case stays fast; the production
 //! default of 10 s is asserted without waiting for it.
 
 use std::sync::{LazyLock, Mutex};
@@ -11,8 +11,9 @@ use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::sandbox::{RunResult, Sandbox, SandboxCfg};
 
 /// A short deadline keeps the timeout test quick without changing any other
-/// limit.
-const FAST_TIMEOUT: Duration = Duration::from_secs(1);
+/// limit. It is long enough that CPython startup plus a compute-heavy script
+/// completes even when other test binaries share the host CPU.
+const FAST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Guest Runs share the host's CPU and memory; running one at a time keeps the
 /// suite fast and the short deadline meaningful even under `cargo test`'s
@@ -63,7 +64,7 @@ fn infinite_loop_traps_at_the_epoch_deadline() {
     assert_eq!(result.stdout, "partial\n");
     assert_eq!(
         last_stderr_line(&result),
-        Some("sandbox: timed out after 1s")
+        Some("sandbox: timed out after 5s")
     );
     assert!(
         !result.stderr.contains("fuel"),
@@ -71,7 +72,7 @@ fn infinite_loop_traps_at_the_epoch_deadline() {
         result.stderr
     );
     assert!(
-        result.duration_ms >= 800,
+        result.duration_ms >= 4000,
         "deadline fired too early: {} ms",
         result.duration_ms
     );
