@@ -13,6 +13,7 @@ use dont_get_rusty::agent::{
     Agent, AgentConfig, Observation, SYSTEM_PROMPT, non_interactive_pause,
 };
 use dont_get_rusty::assets::RuntimeImage;
+use dont_get_rusty::audit::AuditLog;
 use dont_get_rusty::context::{Entry, compact};
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::{
@@ -27,6 +28,11 @@ static SANDBOX: LazyLock<Arc<Sandbox>> = LazyLock::new(|| {
         RuntimeImage::discover().expect("runtime image missing: run `scripts/fetch-assets.sh`");
     Arc::new(Sandbox::new(image.root()).expect("failed to create sandbox"))
 });
+
+/// Holds the Audit Log directory for the whole test binary, outside every
+/// temporary Workspace.
+static AUDIT_DIR: LazyLock<tempfile::TempDir> =
+    LazyLock::new(|| tempfile::tempdir().expect("audit directory should exist"));
 
 #[derive(Debug, Clone)]
 struct Request {
@@ -93,6 +99,7 @@ fn observation(exit_code: i32, stdout: &str, stderr: &str) -> Observation {
             stdout: stdout.to_owned(),
             stderr: stderr.to_owned(),
             timed_out: false,
+            truncated: false,
             duration_ms: 7,
         },
     )
@@ -313,12 +320,15 @@ async fn compaction_sends_exactly_one_llm_request_per_step() {
     };
     let workspace = tempfile::tempdir().unwrap();
     let workspace = Workspace::open(workspace.path()).expect("workspace should open");
+    let audit =
+        AuditLog::open(AUDIT_DIR.path(), workspace.root_path()).expect("audit log should open");
     let result = Agent::new(
         chat.clone(),
         SANDBOX.clone(),
         workspace,
         config,
         Policy::default(),
+        audit,
         non_interactive_pause(),
     )
     .run(task)

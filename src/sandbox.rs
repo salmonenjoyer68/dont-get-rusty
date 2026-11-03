@@ -65,6 +65,9 @@ pub struct RunResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// Whether the capture limit discarded bytes from stdout or stderr; the
+    /// affected stream ends with a truncation marker.
+    pub truncated: bool,
     pub duration_ms: u64,
 }
 
@@ -285,7 +288,7 @@ impl Sandbox {
 
         let (stdout_bytes, stdout_total) = stdout.snapshot();
         let (stderr_bytes, stderr_total) = stderr.snapshot();
-        let mut stderr = decode_capture(stderr_bytes, stderr_total);
+        let (mut stderr, stderr_truncated) = decode_capture(stderr_bytes, stderr_total);
         if let Some(note) = note {
             if !stderr.is_empty() && !stderr.ends_with('\n') {
                 stderr.push('\n');
@@ -293,12 +296,14 @@ impl Sandbox {
             stderr.push_str(&note);
             stderr.push('\n');
         }
+        let (stdout, stdout_truncated) = decode_capture(stdout_bytes, stdout_total);
 
         Ok(RunResult {
             exit_code,
-            stdout: decode_capture(stdout_bytes, stdout_total),
+            stdout,
             stderr,
             timed_out,
+            truncated: stdout_truncated || stderr_truncated,
             duration_ms,
         })
     }
@@ -322,7 +327,9 @@ fn new_engine() -> Result<Engine, SandboxError> {
     Ok(engine)
 }
 
-fn decode_capture(bytes: Vec<u8>, total: u64) -> String {
+/// Decodes one captured stream and reports whether the capture limit dropped
+/// bytes; a truncated stream ends with a marker naming the discarded count.
+fn decode_capture(bytes: Vec<u8>, total: u64) -> (String, bool) {
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
     let discarded = total.saturating_sub(bytes.len() as u64);
     if discarded > 0 {
@@ -333,7 +340,7 @@ fn decode_capture(bytes: Vec<u8>, total: u64) -> String {
             "[sandbox: output truncated; {discarded} bytes discarded]"
         ));
     }
-    text
+    (text, discarded > 0)
 }
 
 // ---- capture stream: drain everything, keep the first `limit` bytes ----

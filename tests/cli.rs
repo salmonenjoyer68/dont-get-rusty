@@ -155,3 +155,26 @@ fn a_policy_file_inside_the_workspace_is_refused() {
     assert!(!output.status.success());
     assert!(stderr.contains("inside the Workspace"), "stderr: {stderr}");
 }
+
+/// The Audit Log is written under the working directory, so using the working
+/// directory as the Workspace leaves it nowhere safe to go.
+#[test]
+fn an_audit_log_inside_the_workspace_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = binary()
+        .arg("say hello")
+        .arg("--workspace")
+        .arg(".")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Audit Log"), "stderr: {stderr}");
+    assert!(stderr.contains("inside the Workspace"), "stderr: {stderr}");
+    assert!(
+        !dir.path().join(".agent").join("audit.jsonl").exists(),
+        "no event is written inside the Workspace"
+    );
+}

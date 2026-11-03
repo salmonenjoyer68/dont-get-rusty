@@ -12,6 +12,7 @@ use dont_get_rusty::agent::{
     Agent, AgentConfig, AgentError, AgentResult, PausePrompt, SYSTEM_PROMPT, non_interactive_pause,
 };
 use dont_get_rusty::assets::RuntimeImage;
+use dont_get_rusty::audit::AuditLog;
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::{
     Chat, ChatResponse, Choice, LlmError, Message, ResponseMessage, ToolCall,
@@ -25,6 +26,11 @@ static SANDBOX: LazyLock<Arc<Sandbox>> = LazyLock::new(|| {
         RuntimeImage::discover().expect("runtime image missing: run `scripts/fetch-assets.sh`");
     Arc::new(Sandbox::new(image.root()).expect("failed to create sandbox"))
 });
+
+/// Holds the Audit Log directory for the whole test binary, outside every
+/// temporary Workspace. Audit contents are asserted by `tests/audit.rs`.
+static AUDIT_DIR: LazyLock<tempfile::TempDir> =
+    LazyLock::new(|| tempfile::tempdir().expect("audit directory should exist"));
 
 #[derive(Debug, Clone)]
 struct Request {
@@ -117,12 +123,16 @@ fn agent_with(
     pause: PausePrompt,
 ) -> Agent {
     let workspace = Workspace::open(workspace.path()).expect("workspace should open");
+    // The Audit Log is written outside the Workspace, as in production.
+    let audit =
+        AuditLog::open(AUDIT_DIR.path(), workspace.root_path()).expect("audit log should open");
     Agent::new(
         chat,
         SANDBOX.clone(),
         workspace,
         config,
         Policy::default(),
+        audit,
         pause,
     )
 }

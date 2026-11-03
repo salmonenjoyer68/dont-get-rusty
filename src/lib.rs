@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod assets;
+pub mod audit;
 pub mod context;
 pub mod fs;
 pub mod llm;

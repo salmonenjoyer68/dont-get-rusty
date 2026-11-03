@@ -7,11 +7,12 @@
 //! answer) or when the configured Step limit is reached.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+use crate::audit::{AuditError, AuditLog};
 use crate::context::{self, Entry};
 use crate::fs::{Workspace, format_listing};
 use crate::llm::{Chat, LlmError, Message, ToolCall};
@@ -86,6 +87,9 @@ pub struct Observation {
     pub stderr: String,
     /// Whether the Run hit the Sandbox deadline.
     pub timed_out: bool,
+    /// Whether the Sandbox discarded output bytes for the model; the affected
+    /// stream carries a truncation marker. Host file tools never truncate.
+    pub truncated: bool,
     /// Wall-clock duration of the Run in milliseconds.
     pub duration_ms: u64,
     /// Number of stdout bytes captured for the model.
@@ -110,6 +114,7 @@ impl Observation {
             stdout: run.stdout,
             stderr: run.stderr,
             timed_out: run.timed_out,
+            truncated: run.truncated,
             duration_ms: run.duration_ms,
             stdout_bytes,
             stderr_bytes,
@@ -126,6 +131,7 @@ impl Observation {
             stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
+            truncated: false,
             duration_ms: 0,
             stdout_bytes: 0,
             stderr_bytes: 0,
@@ -146,6 +152,7 @@ impl Observation {
             stdout,
             stderr: String::new(),
             timed_out: false,
+            truncated: false,
             duration_ms: 0,
             stderr_bytes: 0,
             first_stderr_line: None,
@@ -167,6 +174,7 @@ impl Observation {
             None => out.push_str("exit_code: none\n"),
         }
         out.push_str(&format!("timed_out: {}\n", self.timed_out));
+        out.push_str(&format!("truncated: {}\n", self.truncated));
         out.push_str(&format!("duration_ms: {}\n", self.duration_ms));
         out.push_str(&format!("stdout_bytes: {}\n", self.stdout_bytes));
         out.push_str(&format!("stderr_bytes: {}\n", self.stderr_bytes));
@@ -205,6 +213,9 @@ pub enum AgentError {
     /// Consecutive `run_code` Runs failed and the user declined to continue.
     #[error("stopped after {failed_runs} consecutive failed Runs; last stderr:\n{stderr}")]
     FailedRuns { failed_runs: usize, stderr: String },
+    /// The Audit Log could not be opened or appended to.
+    #[error(transparent)]
+    Audit(#[from] AuditError),
 }
 
 /// A completed Agent Loop run.
@@ -236,13 +247,15 @@ pub struct Agent {
     workspace: Workspace,
     config: AgentConfig,
     policy: Policy,
+    audit: AuditLog,
     pause: PausePrompt,
 }
 
 impl Agent {
     /// Uses `chat` for LLM turns, `sandbox` for `run_code`, `workspace` for
-    /// the file tools and the Guest's read-only `/workspace` preopen, and
-    /// `policy` for every Tool Call decision.
+    /// the file tools and the Guest's read-only `/workspace` preopen,
+    /// `policy` for every Tool Call decision, and `audit` to record every Tool
+    /// Call exactly once.
     ///
     /// `pause` is asked before every further Step once
     /// [`AgentConfig::max_failed_runs`] consecutive Runs have failed; pass
@@ -253,6 +266,7 @@ impl Agent {
         workspace: Workspace,
         config: AgentConfig,
         policy: Policy,
+        audit: AuditLog,
         pause: PausePrompt,
     ) -> Self {
         Self {
@@ -261,6 +275,7 @@ impl Agent {
             workspace,
             config,
             policy,
+            audit,
             pause,
         }
     }
@@ -309,7 +324,7 @@ impl Agent {
             // Every Observation must be in the conversation before the next
             // LLM call.
             for call in &tool_calls {
-                let observation = self.execute(call).await;
+                let observation = self.execute(call, step).await?;
 
                 // A failed Run is a `run_code` with a non-zero exit code,
                 // including traps and timeouts. Error Observations have no
@@ -345,18 +360,48 @@ impl Agent {
         })
     }
 
-    /// Executes one Tool Call. Every Tool Call passes through
-    /// [`Policy::check`] and every failure becomes an Observation, so the loop
-    /// never aborts on a denial or a Tool error.
-    async fn execute(&self, call: &ToolCall) -> Observation {
+    /// Executes one Tool Call, consulting the Policy first and appending one
+    /// Audit Event for it.
+    ///
+    /// The decision is made once, here, from the raw arguments, so every Tool
+    /// Call has a recorded verdict even when its arguments are malformed or its
+    /// name is unknown. A denial becomes an error Observation; an Audit write
+    /// failure ends the loop instead of dropping the event.
+    async fn execute(&self, call: &ToolCall, step: usize) -> Result<Observation, AgentError> {
+        let started = Instant::now();
+        let decision = self.decide(call);
+        let observation = match &decision {
+            Decision::Allow => self.dispatch(call).await,
+            Decision::Deny { reason } => {
+                Observation::error(call.function.name.as_str(), reason.clone())
+            }
+        };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        self.audit
+            .record(step, call, &decision, &observation, duration_ms)?;
+        Ok(observation)
+    }
+
+    /// The Policy verdict for `call`.
+    ///
+    /// The path is read straight out of the raw arguments, so a payload that
+    /// fails to deserialize still reaches the Policy; arguments without a
+    /// readable `path` are checked as a call with no path, which the Policy
+    /// denies for `read_file`/`write_file`.
+    fn decide(&self, call: &ToolCall) -> Decision {
+        let path = argument_path(&call.function.arguments);
+        self.policy.check(&call.function.name, path.as_deref())
+    }
+
+    /// Routes an allowed Tool Call to its tool. Every failure is an error
+    /// Observation, so the loop never aborts on a malformed call.
+    async fn dispatch(&self, call: &ToolCall) -> Observation {
         match call.function.name.as_str() {
             "run_code" => self.run_code(call).await,
             "read_file" => self.read_file(call),
             "write_file" => self.write_file(call),
             "list_files" => self.list_files(call),
-            other => self
-                .denied(other, None)
-                .unwrap_or_else(|| Observation::error(other, format!("unknown tool `{other}`"))),
+            other => Observation::error(other, format!("unknown tool `{other}`")),
         }
     }
 
@@ -367,9 +412,6 @@ impl Agent {
             Ok(args) => args,
             Err(error) => return *error,
         };
-        if let Some(denied) = self.denied("run_code", None) {
-            return denied;
-        }
 
         let sandbox = Arc::clone(&self.sandbox);
         let workspace = self.workspace.root_path().to_path_buf();
@@ -397,9 +439,6 @@ impl Agent {
             Ok(args) => args,
             Err(error) => return *error,
         };
-        if let Some(denied) = self.denied("read_file", Some(&args.path)) {
-            return denied;
-        }
         match self.workspace.read_file(&args.path) {
             Ok(bytes) => Observation::from_text("read_file", String::from_utf8_lossy(&bytes)),
             Err(error) => Observation::error("read_file", error.to_string()),
@@ -415,9 +454,6 @@ impl Agent {
             Ok(args) => args,
             Err(error) => return *error,
         };
-        if let Some(denied) = self.denied("write_file", Some(&args.path)) {
-            return denied;
-        }
         match self
             .workspace
             .write_file(&args.path, args.content.as_bytes())
@@ -437,23 +473,26 @@ impl Agent {
             Ok(args) => args,
             Err(error) => return *error,
         };
-        let path = args.path.as_deref();
-        if let Some(denied) = self.denied("list_files", path) {
-            return denied;
-        }
-        match self.workspace.list_files(path.map(std::path::Path::new)) {
+        match self
+            .workspace
+            .list_files(args.path.as_deref().map(std::path::Path::new))
+        {
             Ok(entries) => Observation::from_text("list_files", format_listing(&entries)),
             Err(error) => Observation::error("list_files", error.to_string()),
         }
     }
+}
 
-    /// Consults the Policy and renders a denial as an error Observation.
-    fn denied(&self, tool: &str, path: Option<&str>) -> Option<Observation> {
-        match self.policy.check(tool, path) {
-            Decision::Allow => None,
-            Decision::Deny { reason } => Some(Observation::error(tool, reason)),
-        }
-    }
+/// The `path` argument of a Tool Call, read from the raw JSON.
+///
+/// The Policy runs before deserialization so that a malformed or surprising
+/// payload still gets a real verdict; a missing or non-string `path` is `None`.
+fn argument_path(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    value
+        .get("path")?
+        .as_str()
+        .map(std::borrow::ToOwned::to_owned)
 }
 
 /// Parses a Tool Call's arguments, turning malformed ones into a boxed error
