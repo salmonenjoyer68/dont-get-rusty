@@ -50,9 +50,25 @@ write_checksums() {
     } >"$target"
 }
 
+# Verify every file already in the image against its checksums.txt entry. This
+# never rewrites the manifest, so a modified stdlib cannot be blessed by
+# re-running the script.
+verify_checksums() {
+    local manifest="$ASSETS/checksums.txt"
+    local line hash path actual
+    [[ -f "$manifest" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        hash="${line%%  *}"
+        path="${line#*  }"
+        [[ -n "$hash" && -n "$path" && -f "$ASSETS/$path" ]] || return 1
+        actual="$(sha256 "$ASSETS/$path")" || return 1
+        [[ "$actual" == "$hash" ]] || return 1
+    done <"$manifest"
+}
+
 if [[ -f "$ASSETS/python.wasm" && -d "$ASSETS/lib/python3.15" ]]; then
-    if [[ "$(sha256 "$ASSETS/python.wasm")" == "$PYTHON_SHA256" ]]; then
-        write_checksums "$ASSETS"
+    if [[ "$(sha256 "$ASSETS/python.wasm")" == "$PYTHON_SHA256" ]] && verify_checksums; then
         printf 'fetch-assets: runtime image already present and verified (%s)\n' "$ASSETS"
         exit 0
     fi
