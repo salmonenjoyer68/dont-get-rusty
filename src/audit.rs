@@ -16,11 +16,13 @@
 //! redacted too: it is model-supplied data crossing the boundary, not
 //! metadata.
 //!
-//! `decision` is `deny` both for a Policy refusal and for a Tool Call that
-//! was allowed to run but failed on the host (quota, escape, overwrite
-//! decline, malformed arguments, Sandbox setup); `denial_reason` carries the
-//! error. A Guest Run always records `allow`, even when its exit code is
-//! non-zero: the Guest ran, and its exit code is the recorded result.
+//! `decision`/`denial_reason` are the Policy verdict alone: `deny` only when
+//! the Policy refused the call, with the reason. A Tool Call the Policy allowed
+//! but that failed on the host (quota, escape, overwrite decline, malformed
+//! arguments, Sandbox setup) stays `allow` and records the host-side error in
+//! `error`; a Policy denial carries `denial_reason` and no `error`. A Guest Run
+//! always records `allow`, even when its exit code is non-zero: the Guest ran,
+//! and its exit code is the recorded result.
 //!
 //! Each event is one synchronous append followed by a flush, so a crash keeps
 //! every completed event and at worst loses the one in flight. A write failure
@@ -55,12 +57,11 @@ const REDACTED_FIELDS: [&str; 3] = ["code", "content", "stdin"];
 
 /// One Audit Event: what was called, what the Policy decided, what it did.
 ///
-/// Field order is the serialized line order. `decision` is `deny` for a
-/// Policy refusal and for a host-side execution failure; `denial_reason` is
-/// absent only when the call was allowed and produced a non-error result
-/// (including a Guest Run with a non-zero exit code). `exit_code` is `null`
-/// for the host file tools and for error Observations, matching
-/// [`Observation::exit_code`].
+/// Field order is the serialized line order. `decision` is the Policy verdict:
+/// `deny` for a Policy refusal, `allow` otherwise. `denial_reason` is present
+/// only for a Policy refusal. `error` is present only when the Policy allowed
+/// the call but it failed on the host. `exit_code` is `null` for the host file
+/// tools and for error Observations, matching [`Observation::exit_code`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuditEvent {
     /// RFC 3339 UTC timestamp of the host write.
@@ -75,16 +76,19 @@ pub struct AuditEvent {
     pub args_sha256: String,
     /// Redacted argument prefix, at most [`MAX_ARGS_PREFIX`] bytes.
     pub args_prefix: String,
-    /// `allow` or `deny`.
+    /// `allow` or `deny`, from the Policy alone.
     pub decision: &'static str,
     /// Why the Policy denied the call; absent for allowed calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub denial_reason: Option<String>,
+    /// Host-side failure of a Policy-allowed call; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Guest exit code, if the Tool Call completed a Run.
     pub exit_code: Option<i32>,
-    /// stdout bytes captured for the model.
+    /// Total stdout bytes the Tool Call produced, before truncation.
     pub stdout_bytes: u64,
-    /// stderr bytes captured for the model.
+    /// Total stderr bytes the Tool Call produced, before truncation.
     pub stderr_bytes: u64,
     /// Whether the Sandbox discarded output bytes for the model.
     pub truncated: bool,
@@ -103,6 +107,7 @@ impl AuditEvent {
         observation: &Observation,
         duration_ms: u64,
     ) -> Self {
+        let allowed = decision.is_allowed();
         Self {
             ts: utc_now(),
             session: session.into(),
@@ -110,12 +115,13 @@ impl AuditEvent {
             tool: call.function.name.clone(),
             args_sha256: sha256_hex(&call.function.arguments),
             args_prefix: args_prefix(&call.function.arguments),
-            decision: if decision.is_allowed() {
-                "allow"
-            } else {
-                "deny"
-            },
+            decision: if allowed { "allow" } else { "deny" },
             denial_reason: decision.reason().map(ToOwned::to_owned),
+            error: if allowed {
+                observation.error.clone()
+            } else {
+                None
+            },
             exit_code: observation.exit_code,
             stdout_bytes: observation.stdout_bytes,
             stderr_bytes: observation.stderr_bytes,
@@ -137,17 +143,16 @@ impl AuditLog {
     /// Opens `<cwd>/.agent/audit.jsonl`, creating `.agent/` when needed.
     ///
     /// Refuses — rather than writing somewhere the model can read — when that
-    /// path would land inside `workspace_root`. Both sides are canonicalized
-    /// first, so a symlinked or relative Workspace is compared by its real
-    /// location.
+    /// path would land inside `workspace_root`. The Workspace is canonicalized
+    /// first and the requested directory is made absolute lexically, so an
+    /// inside-the-Workspace request is refused *before* `create_dir_all` touches
+    /// the disk. After creation the directory is canonicalized again, so a
+    /// symlink that resolves into the Workspace is caught too. A refused start
+    /// leaves the Workspace exactly as it was.
     pub fn open(cwd: &Path, workspace_root: &Path) -> Result<Self, AuditError> {
-        let dir = cwd.join(DIR);
-        std::fs::create_dir_all(&dir).map_err(|source| AuditError::Directory {
-            path: dir.clone(),
-            source,
-        })?;
-        let dir = dir.canonicalize().map_err(|source| AuditError::Resolve {
-            path: dir.clone(),
+        let requested = cwd.join(DIR);
+        let dir = std::path::absolute(&requested).map_err(|source| AuditError::Resolve {
+            path: requested,
             source,
         })?;
         let workspace = workspace_root
@@ -156,8 +161,33 @@ impl AuditLog {
                 path: workspace_root.to_path_buf(),
                 source,
             })?;
+
+        let lexical_path = dir.join(FILE);
+        if lexical_path.starts_with(&workspace) {
+            return Err(AuditError::InsideWorkspace {
+                path: lexical_path,
+                workspace,
+            });
+        }
+
+        let dir_existed = dir.is_dir();
+        std::fs::create_dir_all(&dir).map_err(|source| AuditError::Directory {
+            path: dir.clone(),
+            source,
+        })?;
+        let created = !dir_existed;
+        let dir = dir.canonicalize().map_err(|source| AuditError::Resolve {
+            path: dir.clone(),
+            source,
+        })?;
         let path = dir.join(FILE);
         if path.starts_with(&workspace) {
+            // A symlinked ancestor can hide an inside-the-Workspace path from
+            // the lexical check. Refuse, and undo the directory this call
+            // created so the Workspace is left exactly as it was.
+            if created {
+                let _ = std::fs::remove_dir(&dir);
+            }
             return Err(AuditError::InsideWorkspace { path, workspace });
         }
         Self::at(path)

@@ -50,6 +50,8 @@ fn run_result(exit_code: i32) -> RunResult {
         timed_out: false,
         truncated: false,
         duration_ms: 3,
+        stdout_bytes: 2,
+        stderr_bytes: 0,
     }
 }
 
@@ -95,6 +97,10 @@ fn an_allowed_and_a_denied_call_record_the_expected_fields() {
         allowed.get("denial_reason").is_none(),
         "an allowed call carries no denial reason"
     );
+    assert!(
+        allowed.get("error").is_none(),
+        "a successful Run carries no execution error"
+    );
     assert_eq!(
         allowed["args_sha256"],
         json!("5042e249312efe2f73490958fe0ff77c27bc08a69a2c190b612876a721784b27"),
@@ -121,6 +127,10 @@ fn an_allowed_and_a_denied_call_record_the_expected_fields() {
     assert_eq!(denied["tool"], json!("read_file"));
     assert_eq!(denied["decision"], json!("deny"));
     assert_eq!(denied["denial_reason"], json!(reason));
+    assert!(
+        denied.get("error").is_none(),
+        "a Policy denial carries no execution error"
+    );
     assert_eq!(
         denied["args_sha256"],
         json!("b4ccd46d7a551685a132c7d57ad76df154a3c4ca455a952fa664ff9db46b62db")
@@ -286,8 +296,8 @@ fn a_log_inside_the_workspace_is_refused() {
         "the error names the problem: {error}"
     );
     assert!(
-        !dir.path().join(".agent").join("audit.jsonl").exists(),
-        "nothing is written when the log would be inside the Workspace"
+        !dir.path().join(".agent").exists(),
+        "a refused start must not create `.agent` in the Workspace"
     );
 }
 
@@ -390,8 +400,8 @@ async fn the_loop_records_one_event_per_tool_call_in_request_order() {
         .collect();
     assert_eq!(
         decisions,
-        ["allow", "deny", "deny", "deny"],
-        "a malformed run_code is a host-side failure, not an allow"
+        ["allow", "deny", "deny", "allow"],
+        "decisions are the Policy verdict; a malformed run_code was allowed"
     );
     for event in &events {
         assert_eq!(event["step"], json!(0), "the Step that produced the call");
@@ -400,17 +410,30 @@ async fn the_loop_records_one_event_per_tool_call_in_request_order() {
     }
 
     assert!(events[0].get("denial_reason").is_none());
+    assert!(events[0].get("error").is_none());
     assert_eq!(
         events[1]["denial_reason"],
         json!("invalid path: `..` components are not permitted")
     );
+    assert!(
+        events[1].get("error").is_none(),
+        "a Policy denial carries no execution error"
+    );
     assert_eq!(events[2]["denial_reason"], json!("unknown tool `teleport`"));
     assert!(
-        events[3]["denial_reason"]
+        events[2].get("error").is_none(),
+        "a Policy denial carries no execution error"
+    );
+    assert!(
+        events[3].get("denial_reason").is_none(),
+        "an allowed call has no denial reason"
+    );
+    assert!(
+        events[3]["error"]
             .as_str()
-            .is_some_and(|reason| reason.starts_with("invalid arguments: ")),
-        "the parse error is the recorded reason: {}",
-        events[3]["denial_reason"]
+            .is_some_and(|error| error.starts_with("invalid arguments: ")),
+        "the parse error is recorded as an execution error: {}",
+        events[3]["error"]
     );
     assert_eq!(
         events[3]["args_prefix"],
@@ -428,7 +451,7 @@ async fn the_loop_records_one_event_per_tool_call_in_request_order() {
 }
 
 #[tokio::test]
-async fn a_declined_overwrite_is_audited_as_a_denial_and_a_guest_failure_stays_allow() {
+async fn a_declined_overwrite_keeps_the_policy_allow_and_records_an_error() {
     let cwd = TempDir::new().unwrap();
     let workspace_dir = TempDir::new().unwrap();
     fs::write(workspace_dir.path().join("notes.txt"), "original").unwrap();
@@ -480,15 +503,19 @@ async fn a_declined_overwrite_is_audited_as_a_denial_and_a_guest_failure_stays_a
     assert_eq!(declined["tool"], json!("write_file"));
     assert_eq!(
         declined["decision"],
-        json!("deny"),
-        "a declined overwrite is not an allow"
+        json!("allow"),
+        "the Policy allowed the write; the host refused it at execution"
     );
     assert!(
-        declined["denial_reason"]
+        declined.get("denial_reason").is_none(),
+        "a declined overwrite is not a Policy denial"
+    );
+    assert!(
+        declined["error"]
             .as_str()
-            .is_some_and(|reason| reason.contains("was not confirmed")),
-        "the error is the recorded reason: {}",
-        declined["denial_reason"]
+            .is_some_and(|error| error.contains("was not confirmed")),
+        "the execution failure is the recorded error: {}",
+        declined["error"]
     );
     assert_eq!(declined["exit_code"], Value::Null);
 
@@ -503,5 +530,9 @@ async fn a_declined_overwrite_is_audited_as_a_denial_and_a_guest_failure_stays_a
     assert!(
         failing.get("denial_reason").is_none(),
         "an allowed Guest Run has no denial reason"
+    );
+    assert!(
+        failing.get("error").is_none(),
+        "a completed Guest Run with a non-zero exit records no host error"
     );
 }

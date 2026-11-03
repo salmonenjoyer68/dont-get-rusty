@@ -2,7 +2,7 @@
 //!
 //! A Step is one LLM turn. Every Tool Call in a reply
 //! executes in the order the model requested it, and all of their
-//! [`Observation`]s are appended to the conversation before the next LLM
+//! [`Observation`]s are appended to the history before the next LLM
 //! request. The loop ends when a reply carries no `tool_calls` (the final
 //! answer) or when the configured Step limit is reached.
 
@@ -15,11 +15,11 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::audit::{AuditError, AuditLog};
-use crate::context::{self, Entry};
+use crate::context::{self, HistoryEntry};
 use crate::fs::{Workspace, format_listing, resolve_rel};
 use crate::llm::{Chat, LlmError, Message, ToolCall};
 use crate::policy::{Decision, Policy};
-use crate::sandbox::{RunResult, Sandbox};
+use crate::sandbox::{Lang, RunResult, Sandbox};
 use crate::tools::{self, ListFilesArgs, ReadFileArgs, RunCodeArgs, WriteFileArgs};
 
 /// The v1 system prompt, verbatim from `docs/design.md` § System Prompt.
@@ -46,7 +46,7 @@ pub struct AgentConfig {
     /// Consecutive failed `run_code` Runs that pause the loop; zero disables
     /// the pause.
     pub max_failed_runs: usize,
-    /// Character budget for the conversation before compaction; see
+    /// Character budget for the history before compaction; see
     /// [`crate::context::compact`] for exactly what counts.
     pub context_budget_chars: usize,
     /// OpenAI-compatible API root, including the version segment.
@@ -94,9 +94,9 @@ pub struct Observation {
     pub truncated: bool,
     /// Wall-clock duration of the Run in milliseconds.
     pub duration_ms: u64,
-    /// Number of stdout bytes captured for the model.
+    /// Number of stdout bytes the Tool Call produced, before truncation.
     pub stdout_bytes: u64,
-    /// Number of stderr bytes captured for the model.
+    /// Number of stderr bytes the Tool Call produced, before truncation.
     pub stderr_bytes: u64,
     /// First line of stderr, if the Run produced any.
     pub first_stderr_line: Option<String>,
@@ -107,8 +107,6 @@ pub struct Observation {
 impl Observation {
     /// Builds an Observation from a completed Guest Run.
     pub fn from_run(tool: impl Into<String>, run: RunResult) -> Self {
-        let stdout_bytes = run.stdout.len() as u64;
-        let stderr_bytes = run.stderr.len() as u64;
         let first_stderr_line = run.stderr.lines().next().map(ToOwned::to_owned);
         Self {
             tool: tool.into(),
@@ -118,8 +116,8 @@ impl Observation {
             timed_out: run.timed_out,
             truncated: run.truncated,
             duration_ms: run.duration_ms,
-            stdout_bytes,
-            stderr_bytes,
+            stdout_bytes: run.stdout_bytes,
+            stderr_bytes: run.stderr_bytes,
             first_stderr_line,
             error: None,
         }
@@ -164,7 +162,8 @@ impl Observation {
 
     /// Renders the Observation as the deterministic text of a
     /// [`Message::tool`] content. stdout and stderr are preserved verbatim
-    /// between explicit begin/end markers.
+    /// between explicit begin/end markers; each header names the total bytes
+    /// produced and the bytes shown, so a truncated stream is unambiguous.
     pub fn to_content(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("tool: {}\n", self.tool));
@@ -185,14 +184,16 @@ impl Observation {
             None => out.push_str("first_stderr_line: none\n"),
         }
         out.push_str(&format!(
-            "--- begin stdout ({} bytes) ---\n",
-            self.stdout_bytes
+            "--- begin stdout ({} bytes total; {} bytes shown) ---\n",
+            self.stdout_bytes,
+            self.stdout.len()
         ));
         out.push_str(&self.stdout);
         out.push_str("--- end stdout ---\n");
         out.push_str(&format!(
-            "--- begin stderr ({} bytes) ---\n",
-            self.stderr_bytes
+            "--- begin stderr ({} bytes total; {} bytes shown) ---\n",
+            self.stderr_bytes,
+            self.stderr.len()
         ));
         out.push_str(&self.stderr);
         out.push_str("--- end stderr ---\n");
@@ -247,9 +248,9 @@ pub fn non_interactive_pause() -> PausePrompt {
 ///
 /// The argument is the model-supplied Workspace-relative path, for the prompt
 /// text. Returning `true` allows the write; `false` leaves the file untouched
-/// and becomes a denial Observation, so the loop continues. The Agent only
-/// consults this when the target existed before the session and the path is
-/// not one the agent has already written.
+/// and becomes an error Observation, so the loop continues. The Agent only
+/// consults this when the target existed before the session and the agent did
+/// not create it, so a pre-existing path prompts on every overwrite.
 pub type OverwritePrompt = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// The safe default for a session without a terminal: never overwrite.
@@ -272,10 +273,9 @@ pub struct Agent {
     audit: AuditLog,
     pause: PausePrompt,
     overwrite: OverwritePrompt,
-    /// Workspace-relative paths this session has successfully written. They
-    /// are the "created earlier in the session" files that overwrite without a
-    /// prompt; a pre-existing path enters the set only after its overwrite was
-    /// confirmed.
+    /// Workspace-relative paths this session created with `write_file`. They
+    /// overwrite without a prompt; a file that existed before the session never
+    /// enters this set, so overwriting it asks every time.
     session_writes: Mutex<HashSet<PathBuf>>,
 }
 
@@ -291,8 +291,7 @@ impl Agent {
     ///
     /// `overwrite` is asked before overwriting a file that existed before the
     /// session; pass [`non_interactive_overwrite`] when no user can answer.
-    /// Files the agent created or already overwrote this session never reach
-    /// it.
+    /// Files the agent created this session never reach it.
     // One argument per collaborator the session owns; grouping them would
     // only add an anonymous bag struct.
     #[allow(clippy::too_many_arguments)]
@@ -321,16 +320,16 @@ impl Agent {
 
     /// Runs `task` until the model answers or the Step limit is reached.
     pub async fn run(&self, task: &str) -> Result<AgentResult, AgentError> {
-        let mut conversation = vec![
-            Entry::Message(Message::system(SYSTEM_PROMPT)),
-            Entry::Message(Message::user(task)),
+        let mut history = vec![
+            HistoryEntry::Message(Message::system(SYSTEM_PROMPT)),
+            HistoryEntry::Message(Message::user(task)),
         ];
         let tools = tools::tool_definitions();
         let mut failed_runs = 0usize;
 
         for step in 0..self.config.max_steps {
-            // The full conversation is kept; only the request view is compacted.
-            let request = context::compact(&conversation, self.config.context_budget_chars);
+            // The full history is kept; only the request view is compacted.
+            let request = context::compact(&history, self.config.context_budget_chars);
             let response = self.chat.chat(&request, &tools).await?;
             let choice = response
                 .choices
@@ -355,13 +354,12 @@ impl Agent {
                 }
             }
 
-            conversation.push(Entry::Message(Message::assistant(
+            history.push(HistoryEntry::Message(Message::assistant(
                 content,
                 tool_calls.clone(),
             )));
 
-            // Every Observation must be in the conversation before the next
-            // LLM call.
+            // Every Observation must be in the history before the next LLM call.
             for call in &tool_calls {
                 let observation = self.execute(call, step).await?;
 
@@ -387,7 +385,7 @@ impl Agent {
                     }
                 }
 
-                conversation.push(Entry::Observation {
+                history.push(HistoryEntry::Observation {
                     tool_call_id: call.id.clone(),
                     observation,
                 });
@@ -404,13 +402,12 @@ impl Agent {
     ///
     /// The decision is made once, here, from the raw arguments, so every Tool
     /// Call has a recorded verdict even when its arguments are malformed or its
-    /// name is unknown. A Policy allow whose execution fails (quota, escape,
-    /// overwrite decline, malformed arguments, Sandbox setup) is recorded as a
-    /// denial with the error as the reason, so the log never says `allow` for
-    /// something that did not happen. A completed Guest Run stays `allow` even
-    /// with a non-zero exit code: the Guest ran, and the exit code records the
-    /// outcome. A denial becomes an error Observation; an Audit write failure
-    /// ends the loop instead of dropping the event.
+    /// name is unknown. The Audit Event keeps that Policy verdict in
+    /// `decision`/`denial_reason` and records a host-side execution failure
+    /// separately in `error`, so an `allow` still means "the Policy allowed
+    /// this" and a completed Guest Run stays `allow` even with a non-zero exit
+    /// code. A denial becomes an error Observation; an Audit write failure ends
+    /// the loop instead of dropping the event.
     async fn execute(&self, call: &ToolCall, step: usize) -> Result<Observation, AgentError> {
         let started = Instant::now();
         let decision = self.decide(call);
@@ -420,15 +417,9 @@ impl Agent {
                 Observation::error(call.function.name.as_str(), reason.clone())
             }
         };
-        // A Tool Call that was allowed to run but failed is audited as a
-        // denial: nothing crossed the boundary, and the error says why.
-        let recorded = match (&decision, observation.error.as_deref()) {
-            (Decision::Allow, Some(reason)) => Decision::deny(reason),
-            _ => decision.clone(),
-        };
         let duration_ms = started.elapsed().as_millis() as u64;
         self.audit
-            .record(step, call, &recorded, &observation, duration_ms)?;
+            .record(step, call, &decision, &observation, duration_ms)?;
         Ok(observation)
     }
 
@@ -466,7 +457,12 @@ impl Agent {
         let sandbox = Arc::clone(&self.sandbox);
         let workspace = self.workspace.root_path().to_path_buf();
         let result = tokio::task::spawn_blocking(move || {
-            sandbox.run(&args.code, args.stdin.as_deref(), Some(&workspace))
+            sandbox.run(
+                Lang::Python,
+                &args.code,
+                args.stdin.as_deref(),
+                Some(&workspace),
+            )
         })
         .await;
 
@@ -499,13 +495,12 @@ impl Agent {
     /// and containment checks run before anything is created or truncated.
     ///
     /// The overwrite prompt is required exactly when the target is a file that
-    /// existed before this session and has not already been written by the
-    /// agent. A pre-existing path is prompted once; after a confirmed write,
-    /// later writes to it are silent because it is now a session file. A
-    /// denial leaves the file untouched and becomes an error Observation, so
-    /// the loop continues. `[fs].confirm_overwrite = false` disables the
-    /// prompt. Paths the agent successfully creates or writes are tracked in
-    /// memory for the life of the Agent and are never prompted again.
+    /// existed before this session and the agent did not create it. A
+    /// pre-existing path therefore prompts on every overwrite; only a path the
+    /// agent created with `write_file` is silent, because creating it was the
+    /// agent's own action. A denial leaves the file untouched and becomes an
+    /// error Observation, so the loop continues.
+    /// `[fs].confirm_overwrite = false` disables the prompt.
     fn write_file(&self, call: &ToolCall) -> Observation {
         let args: WriteFileArgs = match parse_args("write_file", call) {
             Ok(args) => args,
@@ -528,10 +523,14 @@ impl Agent {
             .write_file_with_confirm(&args.path, args.content.as_bytes(), confirm)
         {
             Ok(info) => {
-                self.session_writes
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .insert(rel);
+                // Only a file this session created becomes a silent session
+                // path. A pre-existing file prompts again on the next write.
+                if !info.existed {
+                    self.session_writes
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .insert(rel);
+                }
                 Observation::from_text(
                     "write_file",
                     format!("wrote {} bytes to {}", info.bytes_written, args.path),

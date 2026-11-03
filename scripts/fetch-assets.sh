@@ -33,18 +33,26 @@ else
     fail "need sha256sum or shasum to verify the asset"
 fi
 
+# Write a SHA-256 for every file in the image: python.wasm and the whole
+# stdlib tree, with image-relative paths. Startup verifies every entry.
 write_checksums() {
-    local target="$1"
+    local root="$1"
+    local target="$root/checksums.txt"
     {
         printf '# Pinned by %s; do not edit.\n' "$FIX"
-        printf '%s  %s\n' "$ZIP_SHA256" "$ZIP_NAME"
-        printf '%s  python.wasm\n' "$PYTHON_SHA256"
+        (
+            cd -- "$root"
+            find python.wasm lib/python3.15 -type f -print | LC_ALL=C sort |
+                while IFS= read -r file; do
+                    printf '%s  %s\n' "$(sha256 "$file")" "$file"
+                done
+        )
     } >"$target"
 }
 
 if [[ -f "$ASSETS/python.wasm" && -d "$ASSETS/lib/python3.15" ]]; then
     if [[ "$(sha256 "$ASSETS/python.wasm")" == "$PYTHON_SHA256" ]]; then
-        write_checksums "$ASSETS/checksums.txt"
+        write_checksums "$ASSETS"
         printf 'fetch-assets: runtime image already present and verified (%s)\n' "$ASSETS"
         exit 0
     fi
@@ -92,7 +100,7 @@ actual_python="$(sha256 "$stage/python.wasm")"
 [[ "$actual_python" == "$PYTHON_SHA256" ]] ||
     fail "SHA-256 mismatch for extracted python.wasm: got $actual_python, expected $PYTHON_SHA256"
 
-write_checksums "$stage/checksums.txt"
+write_checksums "$stage"
 
 rm -rf "$ASSETS"
 mv "$stage" "$ASSETS"

@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::fs::{FsError, PathError, Workspace};
-use dont_get_rusty::sandbox::{RunResult, Sandbox};
+use dont_get_rusty::sandbox::{Lang, RunResult, Sandbox};
 
 static SANDBOX: LazyLock<Sandbox> = LazyLock::new(|| {
     let image =
@@ -22,7 +22,7 @@ static SANDBOX: LazyLock<Sandbox> = LazyLock::new(|| {
 
 fn run(code: &str, workspace: &Path) -> RunResult {
     SANDBOX
-        .run(code, None, Some(workspace))
+        .run(Lang::Python, code, None, Some(workspace))
         .expect("guest run should not fail at the host level")
 }
 

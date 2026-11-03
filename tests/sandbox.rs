@@ -6,7 +6,7 @@
 use std::sync::LazyLock;
 
 use dont_get_rusty::assets::RuntimeImage;
-use dont_get_rusty::sandbox::{RunResult, Sandbox};
+use dont_get_rusty::sandbox::{Lang, RunResult, Sandbox};
 
 static SANDBOX: LazyLock<Sandbox> = LazyLock::new(|| {
     let image =
@@ -20,7 +20,7 @@ fn shared_sandbox() -> &'static Sandbox {
 
 fn run(code: &str) -> RunResult {
     shared_sandbox()
-        .run(code, None, None)
+        .run(Lang::Python, code, None, None)
         .expect("guest run should not fail at the host level")
 }
 
@@ -87,6 +87,7 @@ fn host_files_are_not_reachable() {
 fn guest_receives_piped_stdin() {
     let result = shared_sandbox()
         .run(
+            Lang::Python,
             "import sys\nprint(sys.stdin.read(), end='')",
             Some("piped\n"),
             None,
@@ -118,6 +119,7 @@ fn guest_reads_the_workspace_through_the_read_only_preopen() {
 
     let result = shared_sandbox()
         .run(
+            Lang::Python,
             "print(open('/workspace/input.txt').read(), end='')",
             None,
             Some(dir.path()),
@@ -141,6 +143,7 @@ fn guest_cannot_write_anywhere_in_the_workspace() {
 
     let result = shared_sandbox()
         .run(
+            Lang::Python,
             "open('/workspace/new.txt', 'w')\nopen('/workspace/input.txt', 'w')",
             None,
             Some(dir.path()),
