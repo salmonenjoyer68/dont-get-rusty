@@ -3,4 +3,6 @@
 #![forbid(unsafe_code)]
 
 pub mod assets;
+pub mod llm;
 pub mod sandbox;
+pub mod tools;
