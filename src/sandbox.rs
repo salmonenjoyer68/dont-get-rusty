@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use wasmtime::{
-    Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, Trap,
+    Cache, CacheConfig, Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits,
+    StoreLimitsBuilder, Trap,
 };
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
@@ -22,11 +23,14 @@ use wasmtime_wasi::{FsPerms, I32Exit, WasiCtxBuilder, async_trait};
 /// Epoch ticker granularity; the timeout is counted in these ticks.
 const TICK: Duration = Duration::from_millis(100);
 
+/// Cache directory name under the `.agent` runtime-artifact directory.
+pub const CACHE_DIR: &str = "cache";
+
 /// Per-Run limits for a [`Sandbox`].
 ///
 /// The defaults are the v1 limits: 256 MB of memory, a 10 s wall-clock
-/// deadline, and 64 KiB of retained output per stream. There is no fuel
-/// budget: CPU time is bounded by the epoch deadline alone.
+/// deadline, 64 KiB of retained output per stream, and no module cache. There
+/// is no fuel budget: CPU time is bounded by the epoch deadline alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCfg {
     /// Per-linear-memory cap in mebibytes. CPython's linear memory starts at
@@ -36,6 +40,12 @@ pub struct SandboxCfg {
     pub timeout: Duration,
     /// Retained bytes per output stream, in kibibytes. Default: 64.
     pub max_output_kb: usize,
+    /// Directory for Wasmtime's compiled-module cache, or `None` to compile
+    /// on every process start. The cache is keyed by the wasm bytes, the
+    /// engine configuration, and the Wasmtime version, so a stale entry is
+    /// never loaded. The CLI uses `<cwd>/.agent/cache`; tests pass a
+    /// temporary directory. Default: `None`.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for SandboxCfg {
@@ -44,6 +54,7 @@ impl Default for SandboxCfg {
             memory_mb: 256,
             timeout: Duration::from_secs(10),
             max_output_kb: 64,
+            cache_dir: None,
         }
     }
 }
@@ -76,6 +87,12 @@ pub struct RunResult {
 pub enum SandboxError {
     #[error("sandbox setup failed: {0}")]
     Wasmtime(#[from] wasmtime::Error),
+    #[error("failed to initialize the compiled-module cache at `{}`", .path.display())]
+    Cache {
+        path: PathBuf,
+        #[source]
+        source: wasmtime::Error,
+    },
     #[error("failed to start the epoch ticker thread: {0}")]
     Ticker(#[from] std::io::Error),
 }
@@ -180,8 +197,13 @@ impl Sandbox {
     }
 
     /// Compiles `python.wasm` and starts the epoch ticker with explicit limits.
+    ///
+    /// When [`SandboxCfg::cache_dir`] is set, the directory is created if
+    /// needed and Wasmtime's on-disk compiled-module cache is enabled; an
+    /// unusable cache directory is a [`SandboxError::Cache`], never a panic
+    /// and never a silently uncached Sandbox.
     pub fn with_cfg(runtime_image: &Path, cfg: SandboxCfg) -> Result<Self, SandboxError> {
-        let engine = new_engine()?;
+        let engine = new_engine(cfg.cache_dir.as_deref())?;
         let module = Module::from_file(&engine, runtime_image.join("python.wasm"))?;
         Ok(Self {
             engine,
@@ -309,9 +331,22 @@ impl Sandbox {
     }
 }
 
-fn new_engine() -> Result<Engine, SandboxError> {
+fn new_engine(cache_dir: Option<&Path>) -> Result<Engine, SandboxError> {
     let mut config = Config::new();
     config.epoch_interruption(true);
+    if let Some(dir) = cache_dir {
+        // A safe compiled-module cache: Wasmtime writes and memory-maps the
+        // artifacts itself, so the agent crate never deserializes a module
+        // and `#![forbid(unsafe_code)]` still holds. `Cache::new` validates
+        // (and creates) the directory, so an unusable path is reported here.
+        let mut cache_config = CacheConfig::new();
+        cache_config.with_directory(dir);
+        let cache = Cache::new(cache_config).map_err(|source| SandboxError::Cache {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        config.cache(Some(cache));
+    }
     let engine = Engine::new(&config)?;
 
     let ticker = engine.clone();

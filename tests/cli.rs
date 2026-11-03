@@ -41,6 +41,35 @@ fn refuses_to_run_without_a_runtime_image() {
 }
 
 #[test]
+fn a_tampered_runtime_image_is_refused_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let assets = dir.path().join("assets");
+    std::fs::create_dir_all(assets.join("lib/python3.15")).unwrap();
+    std::fs::write(assets.join("python.wasm"), b"not the pinned guest").unwrap();
+
+    let output = binary()
+        .arg("say hello")
+        .env("DGR_ASSETS", &assets)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a tampered Guest must be refused before it runs: {stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("sha-256") || stderr.to_lowercase().contains("corrupt"),
+        "stderr names the hash failure: {stderr}"
+    );
+    assert!(stderr.contains(FETCH_COMMAND), "stderr: {stderr}");
+    assert!(
+        !dir.path().join(".agent").exists(),
+        "nothing is written before asset verification"
+    );
+}
+
+#[test]
 fn creates_a_missing_workspace_directory() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("nested/workspace");

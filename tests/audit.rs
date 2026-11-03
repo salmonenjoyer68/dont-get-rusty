@@ -132,13 +132,14 @@ fn an_allowed_and_a_denied_call_record_the_expected_fields() {
 }
 
 #[test]
-fn code_and_file_bodies_never_reach_the_log() {
+fn code_file_bodies_and_piped_input_never_reach_the_log() {
     let cwd = TempDir::new().unwrap();
     let workspace = TempDir::new().unwrap();
     let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
 
     let code = "SECRET_CODE_MARKER = 'delete everything'";
     let content = "SECRET_FILE_BODY_MARKER\nsecond line\n";
+    let stdin = "SECRET_PIPED_INPUT_MARKER\n";
     log.record(
         0,
         &ToolCall::new("a", "run_code", json!({ "code": code }).to_string()),
@@ -159,6 +160,18 @@ fn code_and_file_bodies_never_reach_the_log() {
         1,
     )
     .unwrap();
+    log.record(
+        0,
+        &ToolCall::new(
+            "c",
+            "run_code",
+            json!({ "code": "print(input())", "stdin": stdin }).to_string(),
+        ),
+        &Decision::Allow,
+        &Observation::from_run("run_code", run_result(0)),
+        1,
+    )
+    .unwrap();
 
     let text = fs::read_to_string(log.path()).unwrap();
     assert!(
@@ -169,19 +182,23 @@ fn code_and_file_bodies_never_reach_the_log() {
         !text.contains("SECRET_FILE_BODY_MARKER"),
         "the file body must never be stored: {text}"
     );
+    assert!(
+        !text.contains("SECRET_PIPED_INPUT_MARKER"),
+        "piped stdin must never be stored: {text}"
+    );
     assert!(text.contains("<omitted:"), "redaction marks the fields");
 
     let events = events(log.path());
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     for event in &events {
         let prefix = event["args_prefix"].as_str().unwrap();
         let prefix: Value = serde_json::from_str(prefix).expect("the prefix is valid JSON");
         assert!(
-            prefix
-                .as_object()
-                .unwrap()
-                .values()
-                .all(|value| value.as_str() != Some(code) && value.as_str() != Some(content)),
+            prefix.as_object().unwrap().values().all(|value| {
+                value.as_str() != Some(code)
+                    && value.as_str() != Some(content)
+                    && value.as_str() != Some(stdin)
+            }),
             "no argument value is a stored body: {prefix}"
         );
     }
@@ -189,6 +206,15 @@ fn code_and_file_bodies_never_reach_the_log() {
         events[0]["args_prefix"].as_str().unwrap(),
         format!("{{\"code\":\"<omitted: {} bytes>\"}}", code.len()),
         "the marker counts the full body"
+    );
+    assert_eq!(
+        events[2]["args_prefix"].as_str().unwrap(),
+        format!(
+            "{{\"code\":\"<omitted: {} bytes>\",\"stdin\":\"<omitted: {} bytes>\"}}",
+            "print(input())".len(),
+            stdin.len()
+        ),
+        "piped stdin is redacted alongside the code"
     );
 }
 
@@ -198,14 +224,16 @@ fn a_long_payload_is_hashed_in_full_and_the_prefix_is_cut_on_a_char_boundary() {
     let workspace = TempDir::new().unwrap();
     let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
 
-    let padding = "é".repeat(1500);
-    let arguments = json!({ "code": "print(1)", "stdin": padding }).to_string();
+    // `path` is metadata, not a body, so it is the one argument that survives
+    // redaction long enough to exercise the prefix cut.
+    let path = "é".repeat(1500);
+    let arguments = json!({ "path": path }).to_string();
     assert!(arguments.len() > MAX_ARGS_PREFIX);
     log.record(
         7,
-        &ToolCall::new("a", "run_code", arguments),
+        &ToolCall::new("a", "read_file", arguments.clone()),
         &Decision::Allow,
-        &Observation::from_run("run_code", run_result(0)),
+        &Observation::from_text("read_file", "ok"),
         0,
     )
     .unwrap();
@@ -214,21 +242,20 @@ fn a_long_payload_is_hashed_in_full_and_the_prefix_is_cut_on_a_char_boundary() {
     let event = &events[0];
     assert_eq!(
         event["args_sha256"],
-        json!("da59b9cc2e8d7f110beeeceb735ce952217533c97aa1458aebddfbbb8dd8eb1a"),
+        json!("0c94b4e486194e5d3522978d5a8d633a93c902556342f1dbf324df3c21e18ef0"),
         "the hash covers the full payload, not the prefix"
     );
     let prefix = event["args_prefix"].as_str().unwrap();
-    assert_eq!(prefix.len(), MAX_ARGS_PREFIX, "the prefix fills the budget");
-    assert!(!prefix.contains("print(1)"), "code is redacted first");
-    let redacted = format!(
-        "{{\"code\":\"<omitted: 8 bytes>\",\"stdin\":\"{}\"}}",
-        "é".repeat(1500)
+    assert!(
+        prefix.len() <= MAX_ARGS_PREFIX && prefix.len() + 1 >= MAX_ARGS_PREFIX,
+        "the prefix fills the budget up to a character boundary, got {} bytes",
+        prefix.len()
     );
     assert!(
-        redacted.starts_with(prefix),
+        arguments.starts_with(prefix),
         "truncation only removes the tail and keeps whole characters"
     );
-    assert!(redacted.is_char_boundary(prefix.len()));
+    assert!(arguments.is_char_boundary(prefix.len()));
 }
 
 #[test]
@@ -361,7 +388,11 @@ async fn the_loop_records_one_event_per_tool_call_in_request_order() {
         .iter()
         .map(|event| event["decision"].as_str().unwrap())
         .collect();
-    assert_eq!(decisions, ["allow", "deny", "deny", "allow"]);
+    assert_eq!(
+        decisions,
+        ["allow", "deny", "deny", "deny"],
+        "a malformed run_code is a host-side failure, not an allow"
+    );
     for event in &events {
         assert_eq!(event["step"], json!(0), "the Step that produced the call");
         assert_eq!(event["session"], events[0]["session"]);
@@ -374,7 +405,13 @@ async fn the_loop_records_one_event_per_tool_call_in_request_order() {
         json!("invalid path: `..` components are not permitted")
     );
     assert_eq!(events[2]["denial_reason"], json!("unknown tool `teleport`"));
-    assert!(events[3].get("denial_reason").is_none());
+    assert!(
+        events[3]["denial_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("invalid arguments: ")),
+        "the parse error is the recorded reason: {}",
+        events[3]["denial_reason"]
+    );
     assert_eq!(
         events[3]["args_prefix"],
         json!("<unparsed arguments: 1 bytes>"),
@@ -387,5 +424,84 @@ async fn the_loop_records_one_event_per_tool_call_in_request_order() {
     assert!(
         !audit_path.starts_with(workspace_dir.path().canonicalize().unwrap()),
         "the log stays outside the Workspace"
+    );
+}
+
+#[tokio::test]
+async fn a_declined_overwrite_is_audited_as_a_denial_and_a_guest_failure_stays_allow() {
+    let cwd = TempDir::new().unwrap();
+    let workspace_dir = TempDir::new().unwrap();
+    fs::write(workspace_dir.path().join("notes.txt"), "original").unwrap();
+    let audit = AuditLog::open(cwd.path(), workspace_dir.path()).expect("audit log should open");
+    let audit_path = audit.path().to_path_buf();
+
+    let chat = FakeChat::new(vec![
+        reply(
+            None,
+            vec![
+                ToolCall::new(
+                    "declined",
+                    "write_file",
+                    json!({ "path": "notes.txt", "content": "clobbered" }).to_string(),
+                ),
+                ToolCall::new(
+                    "failing",
+                    "run_code",
+                    json!({ "code": "import sys; sys.exit(3)" }).to_string(),
+                ),
+            ],
+        ),
+        reply(Some("done"), Vec::new()),
+    ]);
+    let workspace = Workspace::open(workspace_dir.path()).expect("workspace should open");
+    let agent = Agent::new(
+        chat,
+        SANDBOX.clone(),
+        workspace,
+        AgentConfig::default(),
+        Policy::default(),
+        audit,
+        non_interactive_pause(),
+        non_interactive_overwrite(),
+    );
+
+    assert_eq!(agent.run("audit failures").await.unwrap().answer, "done");
+
+    assert_eq!(
+        fs::read_to_string(workspace_dir.path().join("notes.txt")).unwrap(),
+        "original",
+        "the declined write touched nothing"
+    );
+
+    let events = events(&audit_path);
+    assert_eq!(events.len(), 2, "one event per Tool Call");
+
+    let declined = &events[0];
+    assert_eq!(declined["tool"], json!("write_file"));
+    assert_eq!(
+        declined["decision"],
+        json!("deny"),
+        "a declined overwrite is not an allow"
+    );
+    assert!(
+        declined["denial_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("was not confirmed")),
+        "the error is the recorded reason: {}",
+        declined["denial_reason"]
+    );
+    assert_eq!(declined["exit_code"], Value::Null);
+
+    let failing = &events[1];
+    assert_eq!(failing["tool"], json!("run_code"));
+    assert_eq!(
+        failing["decision"],
+        json!("allow"),
+        "a Guest Run that exits non-zero still ran"
+    );
+    assert_eq!(failing["exit_code"], json!(3));
+    assert!(
+        failing.get("denial_reason").is_none(),
+        "an allowed Guest Run has no denial reason"
     );
 }

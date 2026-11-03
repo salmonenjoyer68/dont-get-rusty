@@ -138,11 +138,15 @@ impl Policy {
     }
 
     /// Per-Run limits for the Sandbox, from `[sandbox]`.
+    ///
+    /// The module cache is not a policy setting: the CLI points it at
+    /// `<cwd>/.agent/cache`, and tests pass their own temporary directory.
     pub fn sandbox_cfg(&self) -> SandboxCfg {
         SandboxCfg {
             memory_mb: self.sandbox.memory_mb,
             timeout: Duration::from_secs(self.sandbox.timeout_s),
             max_output_kb: self.sandbox.max_output_kb,
+            cache_dir: None,
         }
     }
 

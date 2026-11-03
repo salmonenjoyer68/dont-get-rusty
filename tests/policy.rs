@@ -168,6 +168,7 @@ fn sections_supply_the_sandbox_workspace_and_agent_wiring() {
             memory_mb: 128,
             timeout: Duration::from_secs(3),
             max_output_kb: 8,
+            cache_dir: None,
         }
     );
     assert_eq!(policy.workspace_quota_bytes(), 2 * 1024 * 1024);
