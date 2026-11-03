@@ -195,6 +195,8 @@ request_timeout_s = 120
 
 `max_total_mb` is enforced before each `write_file` by summing workspace file sizes; a write that would exceed it is denied.
 
+Every value has a documented default, so a partial file is valid. `--policy <file>` must name an existing file; without it `./policy.toml` is loaded when present, otherwise the built-in defaults apply. Unknown keys are rejected so a typo cannot silently fall back to a weaker default. The Policy file must live outside the Workspace (startup refuses otherwise) so the model can neither read nor modify it. `network = true` is rejected: v1 grants the Guest no network capability.
+
 ## Audit
 
 Append-only JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Guest cannot read it. One event per Tool Call:

@@ -6,5 +6,6 @@ pub mod agent;
 pub mod assets;
 pub mod fs;
 pub mod llm;
+pub mod policy;
 pub mod sandbox;
 pub mod tools;
