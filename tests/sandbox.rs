@@ -110,3 +110,54 @@ fn guest_cannot_write_to_the_runtime_image() {
         result.stderr
     );
 }
+
+#[test]
+fn guest_reads_the_workspace_through_the_read_only_preopen() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("input.txt"), "workspace input\n").unwrap();
+
+    let result = shared_sandbox()
+        .run(
+            "print(open('/workspace/input.txt').read(), end='')",
+            None,
+            Some(dir.path()),
+        )
+        .expect("guest run should not fail at the host level");
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "workspace input\n");
+    assert_eq!(result.stderr, "");
+    // Reading did not alter the host Workspace.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("input.txt")).unwrap(),
+        "workspace input\n"
+    );
+}
+
+#[test]
+fn guest_cannot_write_anywhere_in_the_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("input.txt"), "keep me\n").unwrap();
+
+    let result = shared_sandbox()
+        .run(
+            "open('/workspace/new.txt', 'w')\nopen('/workspace/input.txt', 'w')",
+            None,
+            Some(dir.path()),
+        )
+        .expect("guest run should not fail at the host level");
+
+    assert_eq!(result.exit_code, 1, "stderr: {}", result.stderr);
+    assert!(
+        result.stderr.contains("PermissionError")
+            || result.stderr.contains("Operation not permitted")
+            || result.stderr.contains("Read-only file system"),
+        "stderr: {}",
+        result.stderr
+    );
+    assert!(!dir.path().join("new.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("input.txt")).unwrap(),
+        "keep me\n"
+    );
+}

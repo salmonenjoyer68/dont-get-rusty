@@ -76,19 +76,16 @@ impl Sandbox {
 
     /// Runs `code` as `python.wasm -u -c <code>` in a fresh Sandbox.
     ///
-    /// The Guest sees the Runtime Image read-only at `/` and nothing else: no
-    /// environment, no network, no writable preopens. `workspace` is accepted
-    /// for the future Workspace capability but is not granted yet.
+    /// The Guest sees the Runtime Image read-only at `/` and, when `workspace`
+    /// is given, the Workspace read-only at `/workspace`. It gets no
+    /// environment, no network, and no writable preopens: durable writes are
+    /// host-mediated through [`crate::fs::Workspace`].
     pub fn run(
         &self,
         code: &str,
         stdin: Option<&str>,
         workspace: Option<&Path>,
     ) -> Result<RunResult, SandboxError> {
-        // Ticket #12 grants no workspace capability; #13 wires the Policy-driven
-        // read-only Workspace preopen.
-        let _ = workspace;
-
         let stdout = Capture::new(CAPTURE_LIMIT);
         let stderr = Capture::new(CAPTURE_LIMIT);
 
@@ -99,6 +96,9 @@ impl Sandbox {
                 .stdout(stdout.clone())
                 .stderr(stderr.clone())
                 .preopened_dir(&self.runtime_image, "/", FsPerms::ReadOnly)?;
+            if let Some(workspace) = workspace {
+                builder.preopened_dir(workspace, "/workspace", FsPerms::ReadOnly)?;
+            }
             if let Some(input) = stdin {
                 builder.stdin(MemoryInputPipe::new(input.to_owned()));
             }
