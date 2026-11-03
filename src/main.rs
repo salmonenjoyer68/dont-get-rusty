@@ -1,10 +1,15 @@
 //! CLI wiring: one-shot `dont-get-rusty "task"`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use dont_get_rusty::agent::{Agent, AgentConfig};
 use dont_get_rusty::assets::RuntimeImage;
+use dont_get_rusty::fs::Workspace;
+use dont_get_rusty::llm::OpenAiClient;
+use dont_get_rusty::sandbox::Sandbox;
 
 /// Workspace root used when neither `--workspace` nor (later) the Policy file
 /// supplies one.
@@ -34,15 +39,17 @@ struct Cli {
     yes: bool,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    RuntimeImage::discover().context("refusing to run without a verified Runtime Image")?;
+    let image =
+        RuntimeImage::discover().context("refusing to run without a verified Runtime Image")?;
 
-    run_agent(cli)
+    run_agent(cli, image).await
 }
 
-fn run_agent(cli: Cli) -> anyhow::Result<()> {
+async fn run_agent(cli: Cli, image: RuntimeImage) -> anyhow::Result<()> {
     let Cli {
         task,
         workspace,
@@ -54,7 +61,17 @@ fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let workspace = workspace.unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE));
     std::fs::create_dir_all(&workspace)
         .with_context(|| format!("failed to create workspace `{}`", workspace.display()))?;
+    let _workspace = Workspace::open(&workspace)
+        .with_context(|| format!("failed to open workspace `{}`", workspace.display()))?;
     let _ = (policy, yes);
 
-    anyhow::bail!("the agent loop is not implemented yet; cannot execute task {task:?}")
+    let config = AgentConfig::default();
+    let sandbox = Arc::new(Sandbox::new(image.root()).context("failed to initialize the Sandbox")?);
+    let client = OpenAiClient::new(&config.base_url, &config.model, config.request_timeout)
+        .context("failed to build the LLM client")?;
+    let agent = Agent::new(Arc::new(client), sandbox, workspace, config);
+
+    let result = agent.run(&task).await?;
+    println!("{}", result.answer);
+    Ok(())
 }

@@ -1,6 +1,8 @@
 //! CLI contract: flags, and refusal to start without a verified Runtime Image.
 
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use dont_get_rusty::assets::FETCH_COMMAND;
 
@@ -43,20 +45,24 @@ fn creates_a_missing_workspace_directory() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("nested/workspace");
 
-    let output = binary()
+    // The binary resolves the Workspace before compiling the Sandbox or
+    // contacting the LLM; kill it once the directory exists so the test never
+    // depends on a running model.
+    let mut child = binary()
         .arg("say hello")
         .arg("--workspace")
         .arg(&workspace)
-        .output()
+        .spawn()
         .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !workspace.is_dir() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 
-    // The Agent Loop is not implemented yet, but resolving the Workspace
-    // happens first and must create it.
-    assert!(!output.status.success());
     assert!(workspace.is_dir(), "workspace was not created");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("the agent loop is not implemented yet"),
-        "stderr: {stderr}"
-    );
 }

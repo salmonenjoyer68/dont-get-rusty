@@ -72,16 +72,21 @@ pub fn tool_def<T: JsonSchema>(name: &str, description: &str) -> Value {
     })
 }
 
+/// The `run_code` tool definition, advertised by the v1 Agent Loop.
+pub fn run_code_tool() -> Value {
+    tool_def::<RunCodeArgs>(
+        "run_code",
+        "Run Python code in an isolated WebAssembly sandbox with no network and no access \
+         to host files. Returns the exit code, stdout, stderr, whether it timed out, and \
+         how long it took. The Python standard library is available. /workspace is the \
+         user's directory and is readable but read-only; write files with write_file.",
+    )
+}
+
 /// The complete tool surface, in the order advertised to the model.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
-        tool_def::<RunCodeArgs>(
-            "run_code",
-            "Run Python code in an isolated WebAssembly sandbox with no network and no access \
-             to host files. Returns the exit code, stdout, stderr, whether it timed out, and \
-             how long it took. The Python standard library is available. /workspace is the \
-             user's directory and is readable but read-only; write files with write_file.",
-        ),
+        run_code_tool(),
         tool_def::<ReadFileArgs>(
             "read_file",
             "Read a UTF-8 text file from the user's workspace. `path` is relative to the \
