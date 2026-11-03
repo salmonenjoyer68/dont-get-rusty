@@ -6,14 +6,16 @@
 //! request. The loop ends when a reply carries no `tool_calls` (the final
 //! answer) or when the configured Step limit is reached.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::context::{self, Entry};
-use crate::fs::{Workspace, format_listing};
+use crate::fs::{Workspace, format_listing, resolve_rel};
 use crate::llm::{Chat, LlmError, Message, ToolCall};
 use crate::policy::{Decision, Policy};
 use crate::sandbox::{RunResult, Sandbox};
@@ -229,6 +231,26 @@ pub fn non_interactive_pause() -> PausePrompt {
     Arc::new(|_last_stderr| false)
 }
 
+/// Decides whether `write_file` may overwrite a file that existed before this
+/// session's first write to it.
+///
+/// The argument is the model-supplied Workspace-relative path, for the prompt
+/// text. Returning `true` allows the write; `false` leaves the file untouched
+/// and becomes a denial Observation, so the loop continues. The Agent only
+/// consults this when the target existed before the session and the path is
+/// not one the agent has already written.
+pub type OverwritePrompt = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// The safe default for a session without a terminal: never overwrite.
+pub fn non_interactive_overwrite() -> OverwritePrompt {
+    Arc::new(|_path| false)
+}
+
+/// Answers yes to every overwrite without asking (the `--yes` behavior).
+pub fn always_overwrite() -> OverwritePrompt {
+    Arc::new(|_path| true)
+}
+
 /// Drives one task through the LLM, the Workspace, and the Sandbox.
 pub struct Agent {
     chat: Arc<dyn Chat>,
@@ -237,6 +259,12 @@ pub struct Agent {
     config: AgentConfig,
     policy: Policy,
     pause: PausePrompt,
+    overwrite: OverwritePrompt,
+    /// Workspace-relative paths this session has successfully written. They
+    /// are the "created earlier in the session" files that overwrite without a
+    /// prompt; a pre-existing path enters the set only after its overwrite was
+    /// confirmed.
+    session_writes: Mutex<HashSet<PathBuf>>,
 }
 
 impl Agent {
@@ -247,6 +275,11 @@ impl Agent {
     /// `pause` is asked before every further Step once
     /// [`AgentConfig::max_failed_runs`] consecutive Runs have failed; pass
     /// [`non_interactive_pause`] when no user can answer.
+    ///
+    /// `overwrite` is asked before overwriting a file that existed before the
+    /// session; pass [`non_interactive_overwrite`] when no user can answer.
+    /// Files the agent created or already overwrote this session never reach
+    /// it.
     pub fn new(
         chat: Arc<dyn Chat>,
         sandbox: Arc<Sandbox>,
@@ -254,6 +287,7 @@ impl Agent {
         config: AgentConfig,
         policy: Policy,
         pause: PausePrompt,
+        overwrite: OverwritePrompt,
     ) -> Self {
         Self {
             chat,
@@ -262,6 +296,8 @@ impl Agent {
             config,
             policy,
             pause,
+            overwrite,
+            session_writes: Mutex::new(HashSet::new()),
         }
     }
 
@@ -408,8 +444,15 @@ impl Agent {
 
     /// Writes one Workspace file through the `cap-std` handle, so the quota
     /// and containment checks run before anything is created or truncated.
-    /// Overwrite confirmation is ticket #8; `confirm_overwrite` is parsed but
-    /// not consulted yet.
+    ///
+    /// The overwrite prompt is required exactly when the target is a file that
+    /// existed before this session and has not already been written by the
+    /// agent. A pre-existing path is prompted once; after a confirmed write,
+    /// later writes to it are silent because it is now a session file. A
+    /// denial leaves the file untouched and becomes an error Observation, so
+    /// the loop continues. `[fs].confirm_overwrite = false` disables the
+    /// prompt. Paths the agent successfully creates or writes are tracked in
+    /// memory for the life of the Agent and are never prompted again.
     fn write_file(&self, call: &ToolCall) -> Observation {
         let args: WriteFileArgs = match parse_args("write_file", call) {
             Ok(args) => args,
@@ -418,14 +461,32 @@ impl Agent {
         if let Some(denied) = self.denied("write_file", Some(&args.path)) {
             return denied;
         }
+        let rel = match resolve_rel(Path::new(&args.path)) {
+            Ok(rel) => rel,
+            Err(error) => return Observation::error("write_file", error.to_string()),
+        };
+        let already_written = self
+            .session_writes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&rel);
+        let confirm = |_rel: &Path| {
+            !self.policy.fs.confirm_overwrite || already_written || (self.overwrite)(&args.path)
+        };
         match self
             .workspace
-            .write_file(&args.path, args.content.as_bytes())
+            .write_file_with_confirm(&args.path, args.content.as_bytes(), confirm)
         {
-            Ok(info) => Observation::from_text(
-                "write_file",
-                format!("wrote {} bytes to {}", info.bytes_written, args.path),
-            ),
+            Ok(info) => {
+                self.session_writes
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(rel);
+                Observation::from_text(
+                    "write_file",
+                    format!("wrote {} bytes to {}", info.bytes_written, args.path),
+                )
+            }
             Err(error) => Observation::error("write_file", error.to_string()),
         }
     }

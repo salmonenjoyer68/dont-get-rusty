@@ -9,7 +9,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use dont_get_rusty::agent::{
-    Agent, AgentConfig, AgentError, AgentResult, PausePrompt, SYSTEM_PROMPT, non_interactive_pause,
+    Agent, AgentConfig, AgentError, AgentResult, PausePrompt, SYSTEM_PROMPT,
+    non_interactive_overwrite, non_interactive_pause,
 };
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::fs::Workspace;
@@ -124,6 +125,7 @@ fn agent_with(
         config,
         Policy::default(),
         pause,
+        non_interactive_overwrite(),
     )
 }
 

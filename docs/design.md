@@ -156,7 +156,7 @@ Rules:
 - A failed run is `run_code` returning a non-zero `exit_code` (including traps). Three consecutive failed runs pause the loop; the CLI asks `continue? [y/N]`. Yes resets the counter; no, or a non-interactive session, ends the session with the last stderr. `--yes` answers the pause with yes, so unattended runs never block on it.
 - A policy denial becomes an error observation; it never aborts the loop.
 - The agent must run its code before claiming it works.
-- `write_file` prompts only when the target existed before the session; agent-created files overwrite silently. `--yes` disables prompts; without a TTY a required confirmation becomes a denial observation.
+- `write_file` prompts only when the target existed before the session; agent-created files overwrite silently. A pre-existing path prompts on its first overwrite only: once written in the session it joins the in-memory session paths and later writes are silent. `--yes` disables prompts; without a TTY a required confirmation becomes a denial observation.
 - Two budgets: capture keeps 64 KB per stream; before each LLM call, compact the message list to `context_budget_chars` from policy — newest results verbatim until the budget is spent, older ones stubbed to `{tool, exit_code, stdout_bytes, first stderr line}`; a newest result that alone exceeds the budget is sent as head+tail with a marker. No LLM summarization.
 - Invalid tool arguments become an error observation; the loop continues.
 

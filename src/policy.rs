@@ -194,8 +194,9 @@ pub struct FsPolicy {
     pub root: PathBuf,
     /// Total size of the Workspace's regular files, in mebibytes. Default: 50.
     pub max_total_mb: u64,
-    /// Parsed for ticket #8. No confirmation is implemented yet, so every
-    /// write is unconditional. Default: true.
+    /// Whether `write_file` asks before overwriting a file that existed
+    /// before the session. Files the agent created earlier in the session are
+    /// always silent; `--yes` disables the prompt. Default: true.
     pub confirm_overwrite: bool,
 }
 

@@ -10,7 +10,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use dont_get_rusty::agent::{
-    Agent, AgentConfig, Observation, SYSTEM_PROMPT, non_interactive_pause,
+    Agent, AgentConfig, Observation, SYSTEM_PROMPT, non_interactive_overwrite,
+    non_interactive_pause,
 };
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::context::{Entry, compact};
@@ -320,6 +321,7 @@ async fn compaction_sends_exactly_one_llm_request_per_step() {
         config,
         Policy::default(),
         non_interactive_pause(),
+        non_interactive_overwrite(),
     )
     .run(task)
     .await

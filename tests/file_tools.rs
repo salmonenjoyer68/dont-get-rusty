@@ -10,7 +10,10 @@ use std::fs;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use dont_get_rusty::agent::{Agent, AgentConfig, non_interactive_pause};
+use dont_get_rusty::agent::{
+    Agent, AgentConfig, OverwritePrompt, always_overwrite, non_interactive_overwrite,
+    non_interactive_pause,
+};
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::{
@@ -101,6 +104,14 @@ fn tool_contents(messages: &[Message]) -> Vec<String> {
 }
 
 fn agent(chat: Arc<FakeChat>, workspace: Workspace) -> Agent {
+    agent_with_overwrite(chat, workspace, non_interactive_overwrite())
+}
+
+fn agent_with_overwrite(
+    chat: Arc<FakeChat>,
+    workspace: Workspace,
+    overwrite: OverwritePrompt,
+) -> Agent {
     Agent::new(
         chat,
         SANDBOX.clone(),
@@ -108,7 +119,19 @@ fn agent(chat: Arc<FakeChat>, workspace: Workspace) -> Agent {
         AgentConfig::default(),
         Policy::default(),
         non_interactive_pause(),
+        overwrite,
     )
+}
+
+/// Records every overwrite prompt and answers with `answer`.
+fn recording_overwrite(answer: bool) -> (OverwritePrompt, Arc<Mutex<Vec<String>>>) {
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&prompts);
+    let prompt: OverwritePrompt = Arc::new(move |path: &str| {
+        seen.lock().unwrap().push(path.to_owned());
+        answer
+    });
+    (prompt, prompts)
 }
 
 #[tokio::test]
@@ -318,5 +341,206 @@ except OSError as error:
     assert!(
         !run.contains("write allowed"),
         "the Guest gained a write capability: {run}"
+    );
+}
+
+#[tokio::test]
+async fn an_approved_overwrite_of_a_preexisting_file_writes() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.txt"), "old").unwrap();
+    let chat = FakeChat::new(vec![
+        reply(None, vec![write_file("w", "notes.txt", "new")]),
+        reply(Some("done"), Vec::new()),
+    ]);
+    let (overwrite, prompts) = recording_overwrite(true);
+    let workspace = Workspace::open(dir.path()).unwrap();
+    let result = agent_with_overwrite(chat.clone(), workspace, overwrite)
+        .run("overwrite")
+        .await
+        .unwrap();
+
+    assert_eq!(result.answer, "done");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "new"
+    );
+    assert_eq!(*prompts.lock().unwrap(), vec!["notes.txt"]);
+
+    let write = &tool_contents(&chat.requests()[1])[0];
+    assert!(write.contains("tool: write_file"), "write: {write}");
+    assert!(
+        write.contains("wrote 3 bytes to notes.txt"),
+        "write: {write}"
+    );
+    assert!(!write.contains("error:"), "write: {write}");
+}
+
+#[tokio::test]
+async fn a_declined_overwrite_is_a_denial_observation_and_leaves_the_file_untouched() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.txt"), "original").unwrap();
+    let chat = FakeChat::new(vec![
+        reply(None, vec![write_file("w", "notes.txt", "clobbered")]),
+        reply(Some("gave up"), Vec::new()),
+    ]);
+    let (overwrite, prompts) = recording_overwrite(false);
+    let workspace = Workspace::open(dir.path()).unwrap();
+    let result = agent_with_overwrite(chat.clone(), workspace, overwrite)
+        .run("overwrite")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.answer, "gave up",
+        "the loop continued past the denial"
+    );
+    assert_eq!(chat.requests().len(), 2);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "original",
+        "a declined overwrite leaves the file untouched"
+    );
+    assert_eq!(*prompts.lock().unwrap(), vec!["notes.txt"]);
+
+    let denied = &tool_contents(&chat.requests()[1])[0];
+    assert!(denied.contains("tool: write_file"), "denied: {denied}");
+    assert!(denied.contains("exit_code: none"), "denied: {denied}");
+    assert!(
+        denied.contains("error: overwrite of `notes.txt` was not confirmed"),
+        "denied: {denied}"
+    );
+    assert!(denied.contains("left unchanged"), "denied: {denied}");
+}
+
+#[tokio::test]
+async fn an_agent_created_file_is_overwritten_without_a_prompt() {
+    let dir = TempDir::new().unwrap();
+    let chat = FakeChat::new(vec![
+        reply(None, vec![write_file("first", "draft.txt", "one")]),
+        reply(None, vec![write_file("second", "draft.txt", "two")]),
+        reply(Some("done"), Vec::new()),
+    ]);
+    let (overwrite, prompts) = recording_overwrite(false);
+    let workspace = Workspace::open(dir.path()).unwrap();
+    let result = agent_with_overwrite(chat, workspace, overwrite)
+        .run("edit the draft")
+        .await
+        .unwrap();
+
+    assert_eq!(result.answer, "done");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("draft.txt")).unwrap(),
+        "two"
+    );
+    assert!(
+        prompts.lock().unwrap().is_empty(),
+        "an agent-created file never prompts"
+    );
+}
+
+#[tokio::test]
+async fn a_non_interactive_overwrite_is_denied_without_touching_the_file() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.txt"), "keep").unwrap();
+    let chat = FakeChat::new(vec![
+        reply(None, vec![write_file("w", "notes.txt", "clobbered")]),
+        reply(Some("skipped"), Vec::new()),
+    ]);
+    let workspace = Workspace::open(dir.path()).unwrap();
+    let result = agent_with_overwrite(chat.clone(), workspace, non_interactive_overwrite())
+        .run("overwrite")
+        .await
+        .unwrap();
+
+    assert_eq!(result.answer, "skipped");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "keep"
+    );
+    let denied = &tool_contents(&chat.requests()[1])[0];
+    assert!(
+        denied.contains("error: overwrite of `notes.txt` was not confirmed"),
+        "denied: {denied}"
+    );
+}
+
+#[tokio::test]
+async fn an_always_yes_overwrite_writes_a_preexisting_file_without_asking() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.txt"), "old").unwrap();
+    let chat = FakeChat::new(vec![
+        reply(None, vec![write_file("w", "notes.txt", "new")]),
+        reply(Some("done"), Vec::new()),
+    ]);
+    let workspace = Workspace::open(dir.path()).unwrap();
+    let result = agent_with_overwrite(chat, workspace, always_overwrite())
+        .run("overwrite")
+        .await
+        .unwrap();
+
+    assert_eq!(result.answer, "done");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "new"
+    );
+}
+
+#[tokio::test]
+async fn a_quota_denied_overwrite_never_reaches_the_confirmation() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("keep.txt"), "12345").unwrap();
+    let chat = FakeChat::new(vec![
+        reply(None, vec![write_file("w", "keep.txt", "123456")]),
+        reply(Some("too big"), Vec::new()),
+    ]);
+    let (overwrite, prompts) = recording_overwrite(true);
+    let workspace = Workspace::open_with_quota(dir.path(), 5).unwrap();
+    let result = agent_with_overwrite(chat.clone(), workspace, overwrite)
+        .run("overwrite")
+        .await
+        .unwrap();
+
+    assert_eq!(result.answer, "too big");
+    assert!(
+        prompts.lock().unwrap().is_empty(),
+        "the quota check runs before the confirmation"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
+        "12345",
+        "a quota denial leaves the file untouched"
+    );
+    let denied = &tool_contents(&chat.requests()[1])[0];
+    assert!(
+        denied.contains("error: workspace quota exceeded"),
+        "denied: {denied}"
+    );
+}
+
+#[tokio::test]
+async fn a_confirmed_overwrite_owns_the_path_for_the_rest_of_the_session() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.txt"), "original").unwrap();
+    let chat = FakeChat::new(vec![
+        reply(None, vec![write_file("first", "notes.txt", "one")]),
+        reply(None, vec![write_file("second", "notes.txt", "two")]),
+        reply(Some("done"), Vec::new()),
+    ]);
+    let (overwrite, prompts) = recording_overwrite(true);
+    let workspace = Workspace::open(dir.path()).unwrap();
+    let result = agent_with_overwrite(chat, workspace, overwrite)
+        .run("overwrite twice")
+        .await
+        .unwrap();
+
+    assert_eq!(result.answer, "done");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "two"
+    );
+    assert_eq!(
+        *prompts.lock().unwrap(),
+        vec!["notes.txt"],
+        "a confirmed path is a session file and later writes are silent"
     );
 }

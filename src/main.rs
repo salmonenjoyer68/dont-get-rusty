@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use dont_get_rusty::agent::{Agent, PausePrompt};
+use dont_get_rusty::agent::{Agent, OverwritePrompt, PausePrompt};
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::OpenAiClient;
@@ -32,8 +32,8 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
 
-    /// Answer yes to every confirmation prompt, including the pause after
-    /// repeated failed Runs
+    /// Answer yes to every confirmation prompt: overwrites of pre-existing
+    /// files and the pause after repeated failed Runs
     #[arg(long)]
     yes: bool,
 }
@@ -84,6 +84,7 @@ async fn run_agent(
         config,
         policy,
         pause_prompt(yes),
+        overwrite_prompt(yes),
     );
 
     let result = agent.run(&task).await?;
@@ -148,4 +149,42 @@ fn pause_prompt(yes: bool) -> PausePrompt {
             Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
         }
     })
+}
+
+/// The `write_file` overwrite decision.
+///
+/// `--yes` answers every overwrite with yes, so unattended runs never block on
+/// the prompt. Otherwise the target path is printed and `overwrite? [y/N]` is
+/// read only when both stdin and stdout are terminals; EOF, an I/O error, or a
+/// non-interactive session answers no, so a pipeline never blocks. For
+/// security, a partial answer (anything but `y`/`yes`) is no.
+fn overwrite_prompt(yes: bool) -> OverwritePrompt {
+    if yes {
+        return Arc::new(|_path| true);
+    }
+
+    Arc::new(|path: &str| {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            return false;
+        }
+        print!("{path} exists; overwrite? [y/N] ");
+        if std::io::stdout().flush().is_err() {
+            return false;
+        }
+        let mut answer = String::new();
+        match std::io::stdin().read_line(&mut answer) {
+            Ok(0) | Err(_) => false,
+            Ok(_) => matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yes_answers_every_overwrite_without_reading_the_terminal() {
+        assert!(overwrite_prompt(true)("notes.txt"));
+    }
 }
