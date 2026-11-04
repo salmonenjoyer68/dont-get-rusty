@@ -3,17 +3,17 @@
 #![forbid(unsafe_code)]
 
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use dont_get_rusty::agent::{Agent, OverwritePrompt, PausePrompt};
+use dont_get_rusty::agent::{Agent, OverwritePrompt, PausePrompt, noop_observer};
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::audit::{AuditLog, DIR as AGENT_DIR};
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::OpenAiClient;
-use dont_get_rusty::policy::Policy;
+use dont_get_rusty::policy::{Policy, ensure_outside_workspace};
 use dont_get_rusty::sandbox::{CACHE_DIR, Sandbox};
 
 #[derive(Debug, Parser)]
@@ -69,7 +69,7 @@ async fn run_agent(
     let workspace_root = workspace.unwrap_or_else(|| policy.workspace_root().to_path_buf());
     std::fs::create_dir_all(&workspace_root)
         .with_context(|| format!("failed to create workspace `{}`", workspace_root.display()))?;
-    ensure_policy_outside_workspace(policy_file.as_deref(), &workspace_root)?;
+    ensure_outside_workspace(policy_file.as_deref(), &workspace_root)?;
     let workspace = Workspace::open_with_quota(&workspace_root, policy.workspace_quota_bytes())
         .with_context(|| format!("failed to open workspace `{}`", workspace_root.display()))?;
     // The Audit Log lives under the working directory, outside the Workspace;
@@ -98,39 +98,11 @@ async fn run_agent(
         audit,
         pause_prompt(yes),
         overwrite_prompt(yes),
+        noop_observer(),
     );
 
     let result = agent.run(&task).await?;
     println!("{}", result.answer);
-    Ok(())
-}
-
-/// Refuses to start when the Policy file is inside the Workspace.
-///
-/// The model reaches files only through the Workspace, so a Policy file there
-/// would be readable and writable through `read_file`/`write_file`. Keeping the
-/// file outside guarantees the model can neither read nor modify it.
-fn ensure_policy_outside_workspace(
-    policy_file: Option<&Path>,
-    workspace_root: &Path,
-) -> anyhow::Result<()> {
-    let Some(policy_file) = policy_file else {
-        return Ok(());
-    };
-    let policy_path = policy_file
-        .canonicalize()
-        .with_context(|| format!("failed to resolve policy file `{}`", policy_file.display()))?;
-    let workspace_path = workspace_root
-        .canonicalize()
-        .with_context(|| format!("failed to resolve workspace `{}`", workspace_root.display()))?;
-    if policy_path.starts_with(&workspace_path) {
-        anyhow::bail!(
-            "policy file `{}` is inside the Workspace `{}`; keep the Policy outside the \
-             Workspace so the model cannot read or modify it",
-            policy_path.display(),
-            workspace_path.display()
-        );
-    }
     Ok(())
 }
 

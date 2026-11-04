@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use async_trait::async_trait;
 use dont_get_rusty::agent::{
     Agent, AgentConfig, Observation, SYSTEM_PROMPT, non_interactive_overwrite,
-    non_interactive_pause,
+    non_interactive_pause, noop_observer,
 };
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::audit::AuditLog;
@@ -389,6 +389,7 @@ async fn compaction_sends_exactly_one_llm_request_per_step() {
         audit,
         non_interactive_pause(),
         non_interactive_overwrite(),
+        noop_observer(),
     )
     .run(task)
     .await

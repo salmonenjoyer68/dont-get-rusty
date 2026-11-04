@@ -13,6 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use async_trait::async_trait;
 use dont_get_rusty::agent::{
     Agent, AgentConfig, Observation, non_interactive_overwrite, non_interactive_pause,
+    noop_observer,
 };
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::audit::{AuditError, AuditLog, MAX_ARGS_PREFIX};
@@ -379,6 +380,7 @@ async fn the_loop_records_one_event_per_tool_call_in_request_order() {
         audit,
         non_interactive_pause(),
         non_interactive_overwrite(),
+        noop_observer(),
     );
 
     assert_eq!(agent.run("audit every call").await.unwrap().answer, "done");
@@ -486,6 +488,7 @@ async fn a_declined_overwrite_keeps_the_policy_allow_and_records_an_error() {
         audit,
         non_interactive_pause(),
         non_interactive_overwrite(),
+        noop_observer(),
     );
 
     assert_eq!(agent.run("audit failures").await.unwrap().answer, "done");

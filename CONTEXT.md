@@ -8,6 +8,14 @@ A local coding agent whose model-generated code runs only inside a WebAssembly s
 The host-side loop that alternates one LLM turn with the execution of the tool calls it requests, stopping at a final answer or the step limit.
 _Avoid_: conversation, session, chat
 
+**Task**:
+The user's natural-language instruction that drives one Agent Loop.
+_Avoid_: prompt, query, job, request
+
+**Confirmation**:
+A question the host asks the user before an action the Policy alone cannot authorise: overwriting a file that existed before the Task, or continuing after repeated failed Runs.
+_Avoid_: prompt, approval, dialog
+
 **Step**:
 One LLM turn in the Agent Loop, together with the execution of every Tool Call it returns.
 _Avoid_: iteration, turn, round
@@ -39,6 +47,10 @@ _Avoid_: stdlib, sysroot, asset
 **Run**:
 One execution of a Guest in a fresh sandbox, producing a single result: exit code, captured output, timeout flag, duration.
 _Avoid_: session, job, invocation
+
+**Web Demo**:
+The localhost browser front-end that submits a Task to the Agent Loop and observes it as it runs.
+_Avoid_: UI, dashboard, playground, web app
 
 **Capability**:
 An explicit grant from the host to a Guest, scoped to one Run. v1 grants read-only access to the Runtime Image and the Workspace.

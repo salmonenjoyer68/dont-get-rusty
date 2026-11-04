@@ -17,7 +17,8 @@ A coding agent written in Rust that runs fully on the user's machine. The LLM wr
 ## Architecture
 
 ```
-User → CLI/TUI → Agent Loop → LLM client (local HTTP)
+User → CLI ────────┐
+Browser → Web Demo ┘→ Agent Loop → LLM client (local HTTP)
                      │
                      ├─ Tool Router (serde-validated)
                      │    ├─ run_code    → Sandbox (Wasmtime + WASI, RO workspace)
@@ -39,6 +40,7 @@ User → CLI/TUI → Agent Loop → LLM client (local HTTP)
 | Tool schemas | `schemars` |
 | Sandboxed FS | `cap-std` ≥ 4.0.3 (model-reachable paths only; blocks `..` and symlink escapes) |
 | CLI | `clap` |
+| Web Demo | `axum` 0.8, `async-stream`, `futures-core` — optional `web` feature |
 | TUI (later) | `ratatui`, `crossterm` |
 | Errors | `thiserror` (libs), `anyhow` (bin) |
 | Audit | hand-written JSONL (`serde_json`), RFC 3339 timestamps from `time` |
@@ -122,6 +124,15 @@ pub struct RunResult {
 Tool schemas are generated with `schemars` and must stay flat: Ollama renders them into the prompt without resolving `$ref`/`$defs` and without validating arguments. Inline subschemas and avoid `anyOf`; invalid arguments from the model become error observations.
 
 ```rust
+// agent.rs: the loop reports progress through this trait; the CLI passes
+// `noop_observer()`, the Web Demo streams the events to the browser.
+pub trait Observer: Send + Sync {
+    fn step_started(&self, step: usize);
+    fn assistant_text(&self, step: usize, text: &str);
+    fn call_started(&self, step: usize, call: &ToolCall);
+    fn observation(&self, step: usize, call: &ToolCall, observation: &Observation);
+}
+
 // sandbox.rs (shape)
 pub struct Sandbox {
     engine: Engine,
@@ -186,6 +197,7 @@ Rules:
 - `write_file` prompts only when the target existed before the session; a file the agent created this session overwrites silently. A pre-existing path prompts on *every* overwrite: only creation by the agent (`WriteInfo::existed == false`) makes a path a session path. `--yes` disables prompts; without a TTY a required confirmation becomes an error observation.
 - Two budgets: capture keeps 64 KB per stream; before each LLM call, compact the message list to `context_budget_chars` from policy — newest results verbatim until the budget is spent, older ones stubbed to `{tool, exit_code, stdout_bytes, first stderr line}`; a newest result that alone exceeds the budget is sent as head+tail with a marker. Compaction is monotonic: once a newer Observation is stubbed or truncated, every older Observation is stubbed too, even if it would still fit. No LLM summarization.
 - Invalid tool arguments become an error observation; the loop continues.
+- Progress goes to an `Observer` (see `docs/adr/0004-agent-observer-seam.md`): `step_started` before each LLM request, `assistant_text` when the reply carries content, `call_started` before execution, and `observation` after the Audit Event is written. Observers are synchronous and must return promptly; they run on the Agent's worker thread.
 
 ## LLM Client
 
@@ -194,6 +206,31 @@ Non-streaming: one `/v1/chat/completions` request per Step, `tools` built from t
 ## CLI
 
 `dont-get-rusty "task"` — one-shot. Flags: `--workspace <dir>` (overrides `[fs].root`), `--policy <file>`, `--yes`. No subcommands in v1.
+
+## Web Demo
+
+`dont-get-rusty-web` (cargo feature `web`) serves the same Agent Loop to a localhost page. Scope is fixed by `docs/adr/0003-web-demo-scope.md`: loopback only, no auth, no CORS, one Task at a time.
+
+```sh
+cargo run --features web --bin dont-get-rusty-web [--workspace DIR] [--policy FILE] [--port 7878]
+```
+
+Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log session) over the shared `Sandbox` and `Chat`. A second submission while one runs gets `409`. There is no cancel button: a Task ends at its answer, its Step limit, or a dropped connection only when it reaches one.
+
+| Route | Meaning |
+|---|---|
+| `GET /`, `/app.js`, `/style.css` | Embedded assets (`include_str!`), no build step |
+| `GET /api/state` | `model`, `workspace`, `running`, retained events (page reload) |
+| `GET /api/events?after=N` | SSE: replay retained events from `N`, then live |
+| `POST /api/task` | `{"task": "..."}`; `202`, `409` while running |
+| `POST /api/decision/{id}` | `{"allow": bool}` answering a Confirmation |
+| `GET /api/workspace?path=` | Read-only Workspace listing |
+| `GET /api/workspace/file?path=` | Read-only file view, capped at 64 KiB |
+| `GET /api/audit` | Last 200 Audit Events |
+
+The SSE stream is driven by a `Notify`-woken replay loop, not a broadcast channel: events are retained per Task, so a reconnect or a page loaded mid-Task replays from index 0 and cannot lose or reorder events. The cursor resets when a new Task clears the transcript.
+
+Confirmations reuse the core's synchronous prompts: the Web Demo blocks the Agent's worker thread (`tokio::task::block_in_place`) on a channel until the page answers, with a 10-minute timeout answered `deny`. Every Step, Tool Call, and Observation is sent to the browser with its arguments and captured output; the Audit Log stays redacted.
 
 ## Policy (`policy.toml`)
 
@@ -249,6 +286,7 @@ Sandbox tests run the real CPython guest, so `scripts/fetch-assets.sh` must run 
 | escape | `open("/workspace/../x", "w")` | read-only preopen |
 | escape | host `write_file` with `..`, absolute path, symlink | `cap-std` error |
 | agent_loop | scripted fake LLM | batch order, denial observation, failed-run pause |
+| web | scripted fake `Chat` over the real routes | one Task streams to `/api/state` and SSE, workspace and audit views, real CPython Guest compiled but no Run |
 
 ## System Prompt (for the LLM)
 
@@ -285,11 +323,19 @@ agent/
 │   ├── sandbox.rs     # Wasmtime embedding, limits
 │   ├── fs.rs          # cap-std workspace wrapper
 │   ├── policy.rs      # load + enforce policy
-│   └── audit.rs       # JSONL audit log
+│   ├── audit.rs       # JSONL audit log
+│   ├── web/           # Web Demo server (feature `web`)
+│   │   ├── hub.rs     # retained events, Confirmations, Observer
+│   │   ├── decisions.rs # prompts -> browser Confirmations
+│   │   ├── server.rs  # routes, AppState, one Task at a time
+│   │   └── assets.rs  # include_str! of web/
+│   └── bin/web.rs     # dont-get-rusty-web entry point
+├── web/               # index.html, app.js, style.css (no build step)
 └── tests/
     ├── escape.rs      # traversal, symlink, absolute path, fd tricks
     ├── limits.rs      # timeout, memory bomb, output flood
-    └── agent_loop.rs  # fake Llm end-to-end
+    ├── agent_loop.rs  # fake Llm end-to-end
+    └── web.rs         # Web Demo routes over a fake Chat (feature `web`)
 ```
 
 ## Security Checklist
@@ -315,6 +361,7 @@ agent/
 - Guest code cannot write files; artifacts leave via stdout or are written by the model with `write_file`.
 - Small local models produce flaky tool calls; schemas stay flat and invalid arguments become observations.
 - Wasmtime WASI API changes between versions; pin the version.
+- The Web Demo runs one Task at a time, has no cancel button, and is loopback-only by design (`docs/adr/0003-web-demo-scope.md`).
 
 ## Milestones
 
@@ -333,7 +380,7 @@ agent/
 - Runtime package installs
 - Network access from the guest
 - JavaScript guest (QuickJS) — post-v1; `Lang` stays extensible
-- Browser UI
+- A public or hosted browser deployment (the loopback Web Demo is in scope)
 
 ## Open Questions
 

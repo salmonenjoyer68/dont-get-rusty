@@ -163,6 +163,42 @@ impl Policy {
     }
 }
 
+/// Refuses a Policy file that lives inside the Workspace.
+///
+/// The model reaches files only through the Workspace, so a Policy file there
+/// would be readable and writable through `read_file`/`write_file`. Keeping the
+/// file outside guarantees the model can neither read nor modify it. Both
+/// paths are canonicalized, so a symlink that resolves into the Workspace is
+/// caught too.
+pub fn ensure_outside_workspace(
+    policy_file: Option<&Path>,
+    workspace_root: &Path,
+) -> Result<(), PolicyError> {
+    let Some(policy_file) = policy_file else {
+        return Ok(());
+    };
+    let policy_path = policy_file
+        .canonicalize()
+        .map_err(|source| PolicyError::PolicyPath {
+            path: policy_file.to_path_buf(),
+            source,
+        })?;
+    let workspace_path =
+        workspace_root
+            .canonicalize()
+            .map_err(|source| PolicyError::WorkspacePath {
+                path: workspace_root.to_path_buf(),
+                source,
+            })?;
+    if policy_path.starts_with(&workspace_path) {
+        return Err(PolicyError::InsideWorkspace {
+            path: policy_path,
+            workspace: workspace_path,
+        });
+    }
+    Ok(())
+}
+
 /// `[sandbox]`: per-Run limits for the Guest.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -313,4 +349,21 @@ pub enum PolicyError {
          Guest network; set network = false"
     )]
     NetworkUnsupported { path: PathBuf },
+    #[error("failed to resolve policy file `{path}`")]
+    PolicyPath {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to resolve workspace `{path}`")]
+    WorkspacePath {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "policy file `{path}` is inside the Workspace `{workspace}`; keep the Policy outside the \
+         Workspace so the model cannot read or modify it"
+    )]
+    InsideWorkspace { path: PathBuf, workspace: PathBuf },
 }

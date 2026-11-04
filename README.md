@@ -56,6 +56,34 @@ Flags:
 A required confirmation in a non-TTY session becomes a denial Observation, so a
 pipeline never hangs.
 
+## Web Demo
+
+The same Agent Loop behind a localhost browser page:
+
+```sh
+cargo run --features web --bin dont-get-rusty-web
+```
+
+It serves `http://127.0.0.1:7878` (loopback only, no authentication, no CORS)
+and prints the model and Workspace it is using. `--workspace` and `--policy`
+behave exactly as in the CLI, and each Task appends its own session to the same
+`.agent/audit.jsonl`. `--port <PORT>` moves the listener.
+
+The page shows every Step, Tool Call, and Observation — including exit codes,
+`timed_out`, truncation, and durations — plus a read-only view of the Workspace
+and the Audit Log. The two Confirmation points (overwriting a pre-existing
+file, continuing after three failed Runs) appear as a modal; an unanswered
+question is denied after ten minutes.
+
+Preset buttons produce repeatable sandbox behaviour: an `/etc/passwd` escape
+attempt, a 10 s timeout, a 300 MB allocation, and a Workspace read.
+
+Deliberate limits: one Task at a time (a second submission gets `409`), no
+cancel button, and no public deployment story — the demo inherits the CLI's
+trust model. See `docs/adr/0003-web-demo-scope.md`. The page is plain
+HTML/CSS/ES modules embedded in the binary, so there is no npm step; editing
+`web/` requires a rebuild.
+
 ## Policy
 
 `policy.toml` is host-side only; the model cannot read or modify it (startup
@@ -113,8 +141,9 @@ Output byte counts are totals produced before truncation.
 ```sh
 scripts/fetch-assets.sh          # once, needs network
 cargo test --offline             # ~3 minutes; the real CPython Guest runs
+cargo test --offline --features web   # adds the Web Demo routes
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 The suite includes a consolidated escape suite against the real Guest

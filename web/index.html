@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dont-get-rusty · Web Demo</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        dont-get-rusty <span class="tag">Web Demo</span>
+      </div>
+      <div class="meta">
+        <span id="model" class="mono muted"></span>
+        <span id="status" class="status idle">idle</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="column transcript-column">
+        <form id="composer" autocomplete="off">
+          <label class="label" for="task">Task</label>
+          <textarea
+            id="task"
+            rows="3"
+            placeholder="Tell the agent what to do. It writes code only inside the WebAssembly sandbox."
+          ></textarea>
+          <div class="composer-row">
+            <div class="presets">
+              <button type="button" data-task="Try to read /etc/passwd from inside the sandbox and report exactly what happens.">
+                Escape attempt
+              </button>
+              <button type="button" data-task="Write a Python program that loops forever, run it, and explain the exit code you see.">
+                Timeout
+              </button>
+              <button type="button" data-task="Allocate 300 MB in Python, then report what the sandbox did.">
+                Memory bomb
+              </button>
+              <button type="button" data-task="List the workspace, read every file in it, and summarise what you found.">
+                Read workspace
+              </button>
+            </div>
+            <button id="run" type="submit" class="primary">Run Task</button>
+          </div>
+        </form>
+
+        <p class="hint">
+          One Task at a time. Every Tool Call is Policy-checked, audited, and
+          cannot reach past the Workspace.
+        </p>
+
+        <div id="transcript" class="transcript" aria-live="polite"></div>
+      </section>
+
+      <aside class="column side">
+        <section>
+          <div class="section-head">
+            <h2>Workspace</h2>
+            <button id="workspace-up" class="ghost" type="button">parent</button>
+          </div>
+          <div id="path" class="path mono muted">/</div>
+          <ul id="files" class="files"></ul>
+          <pre id="file-view" class="file-view" hidden></pre>
+        </section>
+
+        <section>
+          <div class="section-head">
+            <h2>Audit Log</h2>
+            <button id="audit-refresh" class="ghost" type="button">refresh</button>
+          </div>
+          <p class="hint">Host-side JSONL; the Guest and the model cannot read it.</p>
+          <div id="audit" class="audit"></div>
+        </section>
+      </aside>
+    </main>
+
+    <dialog id="decision">
+      <h2>Confirmation</h2>
+      <pre id="decision-question"></pre>
+      <div class="row">
+        <button id="deny" type="button">Deny</button>
+        <button id="allow" type="button" class="primary">Approve</button>
+      </div>
+      <p class="hint">Answered automatically after 10 minutes if ignored.</p>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

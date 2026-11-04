@@ -11,3 +11,6 @@ pub mod llm;
 pub mod policy;
 pub mod sandbox;
 pub mod tools;
+
+#[cfg(feature = "web")]
+pub mod web;

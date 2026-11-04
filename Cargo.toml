@@ -14,12 +14,36 @@ path = "src/lib.rs"
 name = "dont-get-rusty"
 path = "src/main.rs"
 
+[[bin]]
+name = "dont-get-rusty-web"
+path = "src/bin/web.rs"
+required-features = ["web"]
+
+[features]
+default = []
+web = [
+    "dep:axum",
+    "dep:async-stream",
+    "dep:futures-core",
+    "tokio/net",
+    "tokio/sync",
+    "tokio/time",
+]
+
 [dependencies]
+async-stream = { version = "0.3", optional = true }
+axum = { version = "0.8", optional = true, default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+] }
 anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
 cap-std = "4.0.3"
 clap = { version = "4", features = ["derive"] }
+futures-core = { version = "0.3", optional = true }
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 schemars = { version = "1", features = ["derive"] }

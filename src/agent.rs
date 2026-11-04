@@ -201,6 +201,33 @@ impl Observation {
     }
 }
 
+/// Receives progress from [`Agent::run`] as the loop advances.
+///
+/// The Agent Loop never waits for an Observer: every method is synchronous,
+/// takes `&self`, and must return promptly. Implementations that need to do
+/// real work (or block) hand it to another thread. The CLI uses the no-op
+/// default; the Web Demo uses it to stream Steps to the browser.
+pub trait Observer: Send + Sync {
+    /// A Step began; `step` is zero-based.
+    fn step_started(&self, _step: usize) {}
+    /// The model's assistant text for this Step, if it produced any.
+    fn assistant_text(&self, _step: usize, _text: &str) {}
+    /// A Tool Call from this Step is about to be executed.
+    fn call_started(&self, _step: usize, _call: &ToolCall) {}
+    /// The Observation a Tool Call produced, after it was recorded in the
+    /// Audit Log.
+    fn observation(&self, _step: usize, _call: &ToolCall, _observation: &Observation) {}
+}
+
+/// An [`Observer`] that ignores every event; the CLI's default.
+pub fn noop_observer() -> Arc<dyn Observer> {
+    Arc::new(NoopObserver)
+}
+
+struct NoopObserver;
+
+impl Observer for NoopObserver {}
+
 /// Why an [`Agent::run`] stopped without a final answer.
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -273,6 +300,7 @@ pub struct Agent {
     audit: AuditLog,
     pause: PausePrompt,
     overwrite: OverwritePrompt,
+    observer: Arc<dyn Observer>,
     /// Workspace-relative paths this session created with `write_file`. They
     /// overwrite without a prompt; a file that existed before the session never
     /// enters this set, so overwriting it asks every time.
@@ -292,6 +320,9 @@ impl Agent {
     /// `overwrite` is asked before overwriting a file that existed before the
     /// session; pass [`non_interactive_overwrite`] when no user can answer.
     /// Files the agent created this session never reach it.
+    ///
+    /// `observer` receives Step-level progress; pass [`noop_observer`] to run
+    /// silently.
     // One argument per collaborator the session owns; grouping them would
     // only add an anonymous bag struct.
     #[allow(clippy::too_many_arguments)]
@@ -304,6 +335,7 @@ impl Agent {
         audit: AuditLog,
         pause: PausePrompt,
         overwrite: OverwritePrompt,
+        observer: Arc<dyn Observer>,
     ) -> Self {
         Self {
             chat,
@@ -314,6 +346,7 @@ impl Agent {
             audit,
             pause,
             overwrite,
+            observer,
             session_writes: Mutex::new(HashSet::new()),
         }
     }
@@ -328,6 +361,7 @@ impl Agent {
         let mut failed_runs = 0usize;
 
         for step in 0..self.config.max_steps {
+            self.observer.step_started(step);
             // The full history is kept; only the request view is compacted.
             let request = context::compact(&history, self.config.context_budget_chars);
             let response = self.chat.chat(&request, &tools).await?;
@@ -338,6 +372,10 @@ impl Agent {
                 .ok_or(AgentError::EmptyReply)?;
             let content = choice.message.content;
             let mut tool_calls = choice.message.tool_calls;
+
+            if let Some(text) = content.as_deref().filter(|text| !text.is_empty()) {
+                self.observer.assistant_text(step, text);
+            }
 
             if tool_calls.is_empty() {
                 return Ok(AgentResult {
@@ -361,7 +399,9 @@ impl Agent {
 
             // Every Observation must be in the history before the next LLM call.
             for call in &tool_calls {
+                self.observer.call_started(step, call);
                 let observation = self.execute(call, step).await?;
+                self.observer.observation(step, call, &observation);
 
                 // A failed Run is a `run_code` with a non-zero exit code,
                 // including traps and timeouts. Error Observations have no
