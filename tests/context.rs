@@ -330,6 +330,41 @@ fn a_budget_with_no_room_still_answers_every_tool_call() {
 }
 
 #[test]
+fn a_budget_with_no_room_stubs_the_newest_observation_instead_of_a_bare_marker() {
+    let old = observation(1, "old stdout", "old stderr");
+    let new = observation(2, "new stdout", "new stderr");
+    let entries = history(old, new);
+    let fixed = "system".chars().count() + "task".chars().count();
+
+    let messages = compact(&entries, fixed);
+
+    assert_eq!(messages.len(), 5, "every tool call keeps its Observation");
+    let newest_text = tool_content(&messages, "new");
+    assert!(
+        newest_text.contains("tool: run_code"),
+        "the newest Observation must keep its tool name: {newest_text}"
+    );
+    assert!(
+        newest_text.contains("exit_code: 2"),
+        "the newest Observation must keep its exit code: {newest_text}"
+    );
+    assert!(
+        newest_text.contains("first_stderr_line: new stderr"),
+        "the newest Observation must keep its first stderr line: {newest_text}"
+    );
+    assert!(
+        newest_text.contains("compacted Observation"),
+        "the newest Observation must be stubbed: {newest_text}"
+    );
+
+    let oldest_text = tool_content(&messages, "old");
+    assert!(
+        oldest_text.contains("compacted Observation"),
+        "compaction stays monotonic: {oldest_text}"
+    );
+}
+
+#[test]
 fn a_history_within_budget_is_returned_unchanged() {
     let only = observation(0, "fine", "");
     let text = only.to_content();
