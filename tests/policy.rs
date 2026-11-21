@@ -2,6 +2,7 @@
 //! surface the Agent Loop consults. Every test uses a temporary directory.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use dont_get_rusty::agent::AgentConfig;
@@ -14,6 +15,41 @@ fn temp_policy(body: &str) -> (TempDir, PathBuf) {
     let path = dir.path().join("policy.toml");
     std::fs::write(&path, body).unwrap();
     (dir, path)
+}
+
+/// The working directory is process-global, so every test that resolves
+/// `./policy.toml` holds this lock while it runs.
+static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_cwd() -> MutexGuard<'static, ()> {
+    CWD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Points the working directory at a temporary directory for the rest of the
+/// test and restores the previous one on drop.
+struct CwdGuard {
+    previous: PathBuf,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl CwdGuard {
+    fn enter(dir: &Path) -> Self {
+        let lock = lock_cwd();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.previous).expect("failed to restore the working directory");
+    }
 }
 
 #[test]
@@ -40,6 +76,7 @@ fn defaults_match_the_documented_values() {
 
 #[test]
 fn the_committed_policy_file_matches_the_defaults() {
+    let _lock = lock_cwd();
     let from_file = Policy::from_file(Path::new("policy.toml")).expect("policy.toml should parse");
     assert_eq!(from_file, Policy::default());
 }
@@ -92,9 +129,42 @@ fn a_missing_explicit_policy_file_is_an_error_naming_it() {
 
 #[test]
 fn without_the_flag_the_default_file_is_used_when_present() {
+    let _lock = lock_cwd();
     let (policy, source) = Policy::load(None).unwrap();
     assert_eq!(source, Some(PathBuf::from("policy.toml")));
     assert_eq!(policy, Policy::default());
+}
+
+#[test]
+fn without_the_flag_an_absent_default_file_uses_the_defaults() {
+    let dir = TempDir::new().unwrap();
+    let _cwd = CwdGuard::enter(dir.path());
+
+    let (policy, source) = Policy::load(None).unwrap();
+    assert_eq!(policy, Policy::default());
+    assert_eq!(source, None);
+}
+
+#[test]
+fn without_the_flag_a_directory_named_policy_toml_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("policy.toml")).unwrap();
+    let _cwd = CwdGuard::enter(dir.path());
+
+    let error = Policy::load(None).unwrap_err();
+    assert!(
+        matches!(&error, PolicyError::Read { path, .. } if path == Path::new("policy.toml")),
+        "a directory must not select the defaults: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("policy.toml"),
+        "message names the file: {message}"
+    );
+    assert!(
+        message.contains("failed to read"),
+        "message explains the failure: {message}"
+    );
 }
 
 #[test]
@@ -112,6 +182,71 @@ fn load_or_default_reads_a_file_that_exists() {
     let policy = Policy::load_or_default(&path).unwrap();
     assert_eq!(policy.sandbox.memory_mb, 128);
     assert_eq!(policy.agent.max_steps, 25);
+}
+
+#[test]
+fn load_or_default_propagates_a_directory_named_policy_toml() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("policy.toml");
+    std::fs::create_dir(&path).unwrap();
+
+    let error = Policy::load_or_default(&path).unwrap_err();
+    assert!(
+        matches!(&error, PolicyError::Read { path: reported, .. } if reported == &path),
+        "a directory must not select the defaults: {error:?}"
+    );
+}
+
+#[test]
+fn an_explicit_path_to_a_directory_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("policy.toml");
+    std::fs::create_dir(&path).unwrap();
+
+    let error = Policy::load(Some(&path)).unwrap_err();
+    assert!(
+        matches!(&error, PolicyError::Read { path: reported, .. } if reported == &path),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_or_default_propagates_an_unreadable_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, path) = temp_policy("[agent]\nmax_steps = 4\n");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Root can read a mode-000 file, so the case under test cannot occur here.
+    if std::fs::read_to_string(&path).is_ok() {
+        eprintln!("skipping: this process can read mode-000 files");
+        return;
+    }
+
+    let error = Policy::load_or_default(&path).unwrap_err();
+    assert!(
+        matches!(&error, PolicyError::Read { path: reported, .. } if reported == &path),
+        "an unreadable file must not select the defaults: {error:?}"
+    );
+    assert!(
+        error.to_string().contains(path.to_str().unwrap()),
+        "message names the file: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_or_default_propagates_a_symlink_loop() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("policy.toml");
+    std::os::unix::fs::symlink("policy.toml", &path).unwrap();
+
+    let error = Policy::load_or_default(&path).unwrap_err();
+    assert!(
+        matches!(&error, PolicyError::Read { path: reported, .. } if reported == &path),
+        "a symlink that cannot be read must not select the defaults: {error:?}"
+    );
 }
 
 #[test]
