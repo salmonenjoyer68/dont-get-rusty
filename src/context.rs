@@ -29,11 +29,13 @@
 //! the fixed messages:
 //!
 //! 1. an Observation is sent verbatim while its rendered text fits;
-//! 2. the newest Observation, when it does not fit, is sent as its head and
-//!    tail around a `characters omitted` marker;
-//! 3. every other Observation that does not fit is stubbed to its tool name,
-//!    exit code, stdout/stderr byte counts, first stderr line, and — for a
-//!    failed Tool Call — its host-side error message;
+//! 2. the newest Observation, when it does not fit but leaves room for some of
+//!    its text, is sent as its head and tail around a `characters omitted`
+//!    marker;
+//! 3. every Observation that does not fit is stubbed to its tool name, exit
+//!    code, stdout/stderr byte counts, first stderr line, and — for a failed
+//!    Tool Call — its host-side error message; this includes the newest
+//!    Observation when even the marker leaves no room for its text;
 //! 4. stubs keep being emitted after the budget is spent.
 //!
 //! Compaction is monotonic: once an Observation is stubbed or truncated, every
@@ -106,8 +108,11 @@ pub fn compact(entries: &[HistoryEntry], budget_chars: usize) -> Vec<Message> {
             continue;
         }
 
-        if !spent && Some(index) == newest {
-            contents[index] = Some(head_and_tail(&content, remaining));
+        if !spent
+            && Some(index) == newest
+            && let Some(trimmed) = head_and_tail(&content, remaining)
+        {
+            contents[index] = Some(trimmed);
             remaining = 0;
             spent = true;
             continue;
@@ -175,12 +180,14 @@ fn stub(observation: &Observation, rendered_chars: usize) -> String {
 /// Keeps the first and last characters of `content` around a marker naming how
 /// many characters were dropped.
 ///
-/// The result is at most `target_chars` characters, unless that is smaller than
-/// the marker itself, in which case the marker alone is returned.
-fn head_and_tail(content: &str, target_chars: usize) -> String {
+/// The result is at most `target_chars` characters. Returns `None` when the
+/// marker alone would already use the whole target, so no text could be kept;
+/// callers then fall back to the [`stub`] form, which names the tool and exit
+/// code instead of dropping every useful signal.
+fn head_and_tail(content: &str, target_chars: usize) -> Option<String> {
     let total = content.chars().count();
     if total <= target_chars {
-        return content.to_owned();
+        return Some(content.to_owned());
     }
 
     // The omitted count is padded to the width of `total`, so the marker's
@@ -188,6 +195,9 @@ fn head_and_tail(content: &str, target_chars: usize) -> String {
     let digits = total.to_string().len();
     let probe = format!("\n--- [compacted: {total:>digits$} characters omitted] ---\n");
     let keep = target_chars.saturating_sub(probe.chars().count());
+    if keep == 0 {
+        return None;
+    }
     let omitted = total - keep;
     let marker = format!("\n--- [compacted: {omitted:>digits$} characters omitted] ---\n");
 
@@ -197,5 +207,5 @@ fn head_and_tail(content: &str, target_chars: usize) -> String {
     let head: String = chars[..head_len].iter().collect();
     let tail: String = chars[total - tail_len..].iter().collect();
 
-    format!("{head}{marker}{tail}")
+    Some(format!("{head}{marker}{tail}"))
 }

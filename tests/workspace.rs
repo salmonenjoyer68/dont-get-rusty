@@ -429,6 +429,7 @@ proptest! {
         temp.close().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn hostile_paths_with_random_symlinks_never_escape(path in hostile_path(), link in "[A-Za-z0-9_.-]{1,8}") {
         let temp = TempDir::new().unwrap();

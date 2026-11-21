@@ -42,16 +42,18 @@ impl Policy {
     /// file it came from (`None` when the built-in defaults were used).
     ///
     /// `Some(path)` must exist. Without `explicit`, `./policy.toml` is used
-    /// when present, so running from the repository root needs no flags.
+    /// when present, so running from the repository root needs no flags. Only
+    /// an absent file falls back to the defaults: a path that exists but cannot
+    /// be read or parsed — including a directory named `policy.toml` — is an
+    /// error.
     pub fn load(explicit: Option<&Path>) -> Result<(Self, Option<PathBuf>), PolicyError> {
         match explicit {
             Some(path) => Ok((Self::from_file(path)?, Some(path.to_path_buf()))),
             None => {
                 let default = Path::new(DEFAULT_FILE);
-                if default.is_file() {
-                    Ok((Self::from_file(default)?, Some(default.to_path_buf())))
-                } else {
-                    Ok((Self::default(), None))
+                match Self::from_file_if_present(default)? {
+                    Some(policy) => Ok((policy, Some(default.to_path_buf()))),
+                    None => Ok((Self::default(), None)),
                 }
             }
         }
@@ -59,13 +61,23 @@ impl Policy {
 
     /// Loads `path` when it exists, otherwise the built-in defaults.
     ///
-    /// A file that exists but cannot be read or parsed is still an error; only
-    /// absence falls back.
+    /// Only absence falls back: every other read or parse error is propagated,
+    /// so a directory named `policy.toml` or an unreadable file fails loudly
+    /// instead of silently selecting defaults.
     pub fn load_or_default(path: &Path) -> Result<Self, PolicyError> {
-        if path.is_file() {
-            Self::from_file(path)
-        } else {
-            Ok(Self::default())
+        Ok(Self::from_file_if_present(path)?.unwrap_or_default())
+    }
+
+    /// Parses `path`, returning `None` only when no file exists there.
+    ///
+    /// Deciding on the attempted read rather than a preceding `is_file()` keeps
+    /// every other failure — a directory, a permission error, a metadata error
+    /// — an error instead of a silent fallback.
+    fn from_file_if_present(path: &Path) -> Result<Option<Self>, PolicyError> {
+        match Self::from_file(path) {
+            Ok(policy) => Ok(Some(policy)),
+            Err(PolicyError::Missing { .. }) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
