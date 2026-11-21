@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -299,6 +300,153 @@ fn a_log_inside_the_workspace_is_refused() {
     assert!(
         !dir.path().join(".agent").exists(),
         "a refused start must not create `.agent` in the Workspace"
+    );
+}
+
+#[test]
+fn a_partial_final_record_is_quarantined_before_the_next_append() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    log.record(
+        0,
+        &ToolCall::new("first", "list_files", "{}".to_owned()),
+        &Decision::Allow,
+        &Observation::from_text("list_files", "README.md"),
+        1,
+    )
+    .expect("an allowed event should be appended");
+    let path = log.path().to_path_buf();
+    let complete = fs::read_to_string(&path).expect("audit log should be readable");
+    assert_eq!(complete.lines().count(), 1);
+    drop(log);
+
+    // Simulate an append that wrote part of one JSON line and then failed: the
+    // fragment has no terminating newline, so appending the next event would
+    // otherwise merge the two into one unparseable line.
+    let fragment = "{\"ts\":\"2026-11-21T00:00:00Z\",\"session\":\"deadbeef";
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("audit log should append");
+    file.write_all(fragment.as_bytes())
+        .expect("the partial event should be written");
+    file.flush().expect("the partial event should be flushed");
+    drop(file);
+
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should reopen");
+    log.record(
+        0,
+        &ToolCall::new(
+            "second",
+            "read_file",
+            json!({ "path": "README.md" }).to_string(),
+        ),
+        &Decision::Allow,
+        &Observation::from_text("read_file", "hello from the workspace"),
+        1,
+    )
+    .expect("the next event should be appended");
+
+    let text = fs::read_to_string(log.path()).expect("audit log should stay readable");
+    assert!(
+        text.starts_with(&complete),
+        "complete records must not be rewritten: {text}"
+    );
+    let events = events(log.path());
+    assert_eq!(
+        events.len(),
+        2,
+        "the fragment must not swallow the next event: {text}"
+    );
+    assert_eq!(events[0]["tool"], json!("list_files"));
+    assert_eq!(
+        events[1]["tool"],
+        json!("read_file"),
+        "the new event is its own parseable line"
+    );
+
+    let quarantined = fs::read_to_string(log.quarantine_path())
+        .expect("the incomplete record should be preserved in the quarantine file");
+    assert_eq!(
+        quarantined,
+        format!("{fragment}\n"),
+        "the fragment is quarantined verbatim, on its own line"
+    );
+}
+
+#[test]
+fn an_unterminated_complete_record_is_terminated_and_kept() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    log.record(
+        0,
+        &ToolCall::new("first", "list_files", "{}".to_owned()),
+        &Decision::Allow,
+        &Observation::from_text("list_files", "README.md"),
+        1,
+    )
+    .expect("an allowed event should be appended");
+    let path = log.path().to_path_buf();
+    let complete = fs::read_to_string(&path).expect("audit log should be readable");
+    drop(log);
+
+    // A failed append can lose only the final newline while the event itself
+    // is complete: such a record is recoverable, not corrupt.
+    fs::write(&path, &complete[..complete.len() - 1]).expect("the newline should be dropped");
+
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should reopen");
+    assert!(
+        !log.quarantine_path().exists(),
+        "a complete record must not be quarantined"
+    );
+    assert_eq!(
+        fs::read_to_string(log.path()).expect("audit log should be readable"),
+        complete,
+        "the missing newline is restored and the record is kept"
+    );
+
+    log.record(
+        0,
+        &ToolCall::new(
+            "second",
+            "read_file",
+            json!({ "path": "README.md" }).to_string(),
+        ),
+        &Decision::Allow,
+        &Observation::from_text("read_file", "hello"),
+        1,
+    )
+    .expect("the next event should be appended");
+    assert_eq!(events(log.path()).len(), 2);
+}
+
+#[test]
+fn a_partial_record_larger_than_one_tail_read_is_still_quarantined() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let complete = "{\"tool\":\"list_files\"}\n";
+    let fragment = format!(
+        "{{\"ts\":\"2026-11-21T00:00:00Z\",\"padding\":\"{}\"",
+        "x".repeat(20 * 1024)
+    );
+    fs::write(&path, format!("{complete}{fragment}")).expect("the partial log should be written");
+
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should reopen");
+    assert_eq!(
+        fs::read_to_string(log.path()).expect("audit log should be readable"),
+        complete,
+        "the partial tail is cut and the complete record is kept"
+    );
+    assert_eq!(
+        fs::read_to_string(log.quarantine_path()).expect("quarantine should be readable"),
+        format!("{fragment}\n"),
+        "the whole partial record is preserved, not just the last chunk"
     );
 }
 
