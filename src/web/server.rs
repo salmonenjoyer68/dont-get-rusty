@@ -4,6 +4,11 @@
 //! loopback by the binary and the page is served from the same origin, so there
 //! is no CORS surface. The Agent Loop is the same one the CLI drives; this
 //! module only translates it to HTTP.
+//!
+//! Binding loopback does not stop DNS rebinding: the attacker's page keeps its
+//! own Host and Origin while its hostname resolves to `127.0.0.1`. The router
+//! therefore validates the Host (and, on state-changing requests, the Origin)
+//! before any handler sees the request.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -11,8 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_stream::stream;
+use axum::extract::Request;
 use axum::extract::{Path as UrlPath, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -72,6 +79,68 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/workspace/file", get(read_workspace_file))
         .route("/api/audit", get(audit))
         .with_state(state)
+        .layer(middleware::from_fn(loopback_only))
+}
+
+/// Rejects requests a DNS-rebinding page could issue. The listener is bound to
+/// loopback, but a rebinding page still sends its own `Host` (and `Origin`),
+/// so neither is trusted to name the Web Demo.
+async fn loopback_only(request: Request, next: Next) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok());
+    if !host.is_some_and(is_loopback_host) {
+        return api_error(StatusCode::BAD_REQUEST, "Host is not loopback");
+    }
+    if is_state_changing(request.method())
+        && let Some(origin) = request.headers().get(header::ORIGIN)
+    {
+        let origin = origin.to_str().unwrap_or_default();
+        if !is_loopback_origin(origin) {
+            return api_error(StatusCode::FORBIDDEN, "Origin is not loopback");
+        }
+    }
+    next.run(request).await
+}
+
+/// Only a request without side effects may skip the Origin check. Everything
+/// except the safe methods is treated as state-changing.
+fn is_state_changing(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// True for an `http`/`https` Origin whose authority is loopback. `null` and
+/// anything unparseable count as foreign: a browser never serializes a
+/// same-origin request that way.
+fn is_loopback_origin(value: &str) -> bool {
+    let Some((scheme, authority)) = value.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'@' | b'?' | b'#'))
+    {
+        return false;
+    }
+    is_loopback_host(authority)
+}
+
+/// True for `127.0.0.1` or `localhost`, optionally followed by a numeric port,
+/// compared case-insensitively. A trailing `:port` is the listener's, not
+/// evidence of identity: the host is the only part that proves loopback.
+fn is_loopback_host(value: &str) -> bool {
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    };
+    let port_ok =
+        port.is_none_or(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()));
+    port_ok && (host.eq_ignore_ascii_case("127.0.0.1") || host.eq_ignore_ascii_case("localhost"))
 }
 
 async fn index() -> Response {
