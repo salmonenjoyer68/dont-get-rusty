@@ -42,14 +42,6 @@ report_success() {
     printf 'ok - %s\n' "$*"
 }
 
-sha256_of() {
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{print $1}'
-    else
-        shasum -a 256 "$1" | awk '{print $1}'
-    fi
-}
-
 # A throwaway Runtime Image: the Guest plus one stdlib file.
 new_image() {
     local root
@@ -63,7 +55,7 @@ new_image() {
 # Prints a `<sha256>  <relative path>` entry for one file in the image.
 write_entry() {
     local root="$1" relative="$2"
-    printf '%s  %s\n' "$(sha256_of "$root/$relative")" "$relative"
+    printf '%s  %s\n' "$(sha256 "$root/$relative")" "$relative"
 }
 
 expect_reject() {
@@ -105,7 +97,7 @@ run_main() {
     (
         ASSETS="$image"
         CACHE="$cache"
-        PYTHON_SHA256="$(sha256_of "$image/python.wasm")"
+        PYTHON_SHA256="$(sha256 "$image/python.wasm")"
         export FAKE_CURL_LOG="$log"
         PATH="$bin:$PATH"
         main
@@ -137,7 +129,7 @@ expect_reject "missing checksums.txt is rejected" "$root"
 root="$(new_image)"
 {
     write_entry "$root" python.wasm
-    printf '%s  %s\n' "$(sha256_of "$root/lib/python3.15/os.py")" "/lib/python3.15/os.py"
+    printf '%s  %s\n' "$(sha256 "$root/lib/python3.15/os.py")" "/lib/python3.15/os.py"
 } >"$root/checksums.txt"
 expect_reject "manifest with an absolute path is rejected" "$root"
 
@@ -145,10 +137,26 @@ root="$(new_image)"
 {
     write_entry "$root" python.wasm
     printf '%s  %s\n' \
-        "$(sha256_of "$root/lib/python3.15/os.py")" \
+        "$(sha256 "$root/lib/python3.15/os.py")" \
         "../$(basename "$root")/lib/python3.15/os.py"
 } >"$root/checksums.txt"
 expect_reject "manifest with a .. path is rejected" "$root"
+
+# A CurDir component is not a Normal component: startup's parse_checksums
+# rejects `.` everywhere, including a leading `./`.
+root="$(new_image)"
+{
+    write_entry "$root" python.wasm
+    printf '%s  %s\n' "$(sha256 "$root/lib/python3.15/os.py")" "./lib/python3.15/os.py"
+} >"$root/checksums.txt"
+expect_reject "manifest with a leading . path component is rejected" "$root"
+
+root="$(new_image)"
+{
+    write_entry "$root" python.wasm
+    printf '%s  %s\n' "$(sha256 "$root/lib/python3.15/os.py")" "lib/./python3.15/os.py"
+} >"$root/checksums.txt"
+expect_reject "manifest with an inner . path component is rejected" "$root"
 
 # The behaviour that must keep working.
 root="$(new_image)"
