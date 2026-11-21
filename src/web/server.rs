@@ -120,6 +120,9 @@ async fn events(
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let hub = Arc::clone(&state.hub);
     let mut cursor = query.after.unwrap_or_default();
+    // Subscribe before the first transcript read: a change that lands between
+    // the read and the wait still wakes this stream, and every stream wakes.
+    let mut changed = hub.subscribe();
     let mut epoch = hub.epoch();
     let stream = stream! {
         loop {
@@ -132,7 +135,7 @@ async fn events(
             }
             cursor = next_cursor;
             if batch.is_empty() {
-                hub.changed().await;
+                changed.changed().await;
                 continue;
             }
             for event in batch {

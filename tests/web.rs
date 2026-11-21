@@ -245,3 +245,86 @@ async fn a_task_streams_events_and_the_page_can_read_workspace_and_audit() {
 
     server.abort();
 }
+
+/// Two browser tabs both see an event pushed after they connected.
+///
+/// The Hub must wake every SSE subscriber, not just one: a single-waiter
+/// wakeup leaves the other tab stale until it reconnects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_sse_readers_receive_an_event_pushed_after_they_connect() {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let audit_dir = tempfile::tempdir().expect("audit dir");
+    let audit_path = audit_dir.path().join(".agent").join("audit.jsonl");
+    std::fs::create_dir_all(audit_path.parent().expect("parent")).expect("audit parent");
+
+    let state = test_state(workspace.path(), audit_dir.path(), &audit_path);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(serve_on(listener, Arc::clone(&state)));
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // A finished warm-up Task gives both readers a replay to drain, so their
+    // "ready" signals below mean the stream is connected and caught up.
+    let warm_up = state.hub.start("warm-up").expect("warm-up Task");
+    drop(warm_up);
+
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<()>(2);
+    let mut readers = Vec::new();
+    for _ in 0..2 {
+        let client = client.clone();
+        let url = format!("{base}/api/events?after=0");
+        let ready = ready_tx.clone();
+        readers.push(tokio::spawn(async move {
+            let mut response = client.get(url).send().await.expect("events");
+            assert_eq!(response.status(), 200);
+            let mut body = String::new();
+            let mut announced = false;
+            loop {
+                let chunk = response.chunk().await.expect("chunk").expect("body");
+                body.push_str(&String::from_utf8_lossy(&chunk));
+                if !announced && body.contains(r#""type":"task_finished""#) {
+                    announced = true;
+                    ready.send(()).await.expect("ready");
+                }
+                if body.contains(r#""type":"task_started","task":"second task""#) {
+                    return body;
+                }
+            }
+        }));
+    }
+    drop(ready_tx);
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(10), ready_rx.recv())
+            .await
+            .expect("both readers should replay the warm-up")
+            .expect("ready signal");
+    }
+    // Let each reader leave the replay loop and wait on the Hub's change
+    // signal, so the measured event can only arrive through that wakeup.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let second_task = state.hub.start("second task").expect("second Task");
+    let joined = tokio::time::timeout(Duration::from_secs(5), async {
+        let first = (&mut readers[0]).await.expect("first reader");
+        let second = (&mut readers[1]).await.expect("second reader");
+        (first, second)
+    })
+    .await;
+    if joined.is_err() {
+        for reader in &readers {
+            reader.abort();
+        }
+    }
+    let (first_body, second_body) =
+        joined.expect("both SSE readers should receive the event within 5s");
+    for body in [&first_body, &second_body] {
+        assert!(
+            body.contains(r#""type":"task_started","task":"second task""#),
+            "both readers should see the second Task start: {body}"
+        );
+    }
+
+    drop(second_task);
+    server.abort();
+}
