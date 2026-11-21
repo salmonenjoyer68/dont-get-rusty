@@ -16,6 +16,10 @@
 //! redacted too: it is model-supplied data crossing the boundary, not
 //! metadata.
 //!
+//! Each opened log is one session: it gets a fresh id, and every event it
+//! appends carries that id. The CLI opens one log per process; the Web Demo
+//! opens one per Task.
+//!
 //! `decision`/`denial_reason` are the Policy verdict alone: `deny` only when
 //! the Policy refused the call, with the reason. A Tool Call the Policy allowed
 //! but that failed on the host (quota, escape, overwrite decline, malformed
@@ -42,7 +46,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -77,7 +81,8 @@ const REDACTED_FIELDS: [&str; 3] = ["code", "content", "stdin"];
 pub struct AuditEvent {
     /// RFC 3339 UTC timestamp of the host write.
     pub ts: String,
-    /// Id shared by every event of one process; generated once per process.
+    /// Id shared by every event written through one Audit Log; generated when
+    /// the log is opened.
     pub session: String,
     /// Step (LLM turn) that produced the Tool Call, zero-based.
     pub step: usize,
@@ -218,6 +223,11 @@ impl AuditLog {
     /// same rule. An unterminated final record left by a failed append is
     /// repaired before the log is returned, so the next event cannot merge into
     /// the fragment.
+    ///
+    /// Each handle gets a fresh session id: the events it writes are one
+    /// identifiable session even when another Audit Log opens in the same
+    /// process. The CLI opens one log per process, so its run stays one
+    /// session; the Web Demo opens one log per Task, so each Task gets its own.
     pub fn at(path: impl Into<PathBuf>) -> Result<Self, AuditError> {
         let path = path.into();
         let mut file = open_append_nofollow(&path)?;
@@ -225,7 +235,7 @@ impl AuditLog {
         Ok(Self {
             quarantine: quarantine_path(&path),
             path,
-            session: SESSION.clone(),
+            session: new_session(),
             file: Mutex::new(file),
         })
     }
@@ -241,7 +251,7 @@ impl AuditLog {
         &self.quarantine
     }
 
-    /// The id shared by every event of this process.
+    /// The id shared by every event this Audit Log writes.
     pub fn session(&self) -> &str {
         &self.session
     }
@@ -284,11 +294,15 @@ impl AuditLog {
     }
 }
 
-/// The id shared by every event of one process.
+/// A fresh id for one Audit Log, shared by every event that log writes.
 ///
-/// A process handles one session, so the id is generated once and reused for
-/// every event.
-static SESSION: LazyLock<String> = LazyLock::new(|| format!("{:016x}", rand::random::<u64>()));
+/// Generated per handle, not per process: the CLI opens one log per process,
+/// so its events share one id, while the Web Demo opens one log per Task, so
+/// each Task gets a new id instead of reusing a session whose Step counter
+/// restarted at 0.
+fn new_session() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
 
 /// Opens `path` for appending without following a symlinked final component.
 ///
