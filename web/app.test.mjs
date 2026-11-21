@@ -96,11 +96,17 @@ const IDS = [
   'deny',
   'audit-refresh',
   'workspace-up',
+  'decision-error',
 ];
+
+let eventSources = [];
 
 class FakeEventSource {
   constructor(url) {
     this.url = url;
+    this.onopen = null;
+    this.onmessage = null;
+    eventSources.push(this);
   }
 }
 
@@ -123,8 +129,15 @@ const errorResponse = (status) => ({
   json: async () => ({}),
   text: async () => '',
 });
+const acceptedResponse = () => ({
+  ok: true,
+  status: 204,
+  json: async () => ({}),
+  text: async () => '',
+});
 
 function makeApp() {
+  eventSources = [];
   const byId = new Map(IDS.map((id) => [id, new FakeElement('div')]));
   const elements = {
     document: {
@@ -144,11 +157,15 @@ function makeApp() {
   };
 
   const pending = [];
-  elements.fetch = (url) => {
+  const answers = [];
+  elements.fetch = (url, options = {}) => {
     if (url === '/api/state') {
       return Promise.resolve(okResponse({ model: 'test', running: false }));
     }
     if (url === '/api/audit') return Promise.resolve(okResponse([]));
+    if (url.startsWith('/api/decision/')) {
+      return new Promise((resolve, reject) => answers.push({ url, options, resolve, reject }));
+    }
     assert.match(url, /^\/api\/workspace\?path=/);
     const path = new URL(url, 'http://localhost').searchParams.get('path') || '';
     return new Promise((resolve) => pending.push({ path, resolve }));
@@ -180,6 +197,26 @@ function makeApp() {
   };
   const clickById = (id) => click(byId.get(id));
 
+  const takeAnswer = async () => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (answers.length) return answers.shift();
+      await flush();
+    }
+    throw new Error('no pending decision answer request');
+  };
+
+  const ready = async () => {
+    const root = await take('');
+    root.resolve(okResponse([]));
+    await flush();
+  };
+
+  const emit = (event) => {
+    const source = eventSources.at(-1);
+    assert.ok(source, 'the app connected to the event stream');
+    source.onmessage({ data: JSON.stringify(event) });
+  };
+
   return {
     path: () => byId.get('path').textContent,
     labels,
@@ -187,6 +224,15 @@ function makeApp() {
     click,
     clickById,
     take,
+    takeAnswer,
+    ready,
+    emit,
+    dialogOpen: () => byId.get('decision').open,
+    question: () => byId.get('decision-question').textContent,
+    decisionError: () => byId.get('decision-error').textContent,
+    decisionErrorHidden: () => byId.get('decision-error').hidden,
+    lines: () => byId.get('transcript').children.map((line) => line.textContent),
+    pendingAnswers: () => answers.length,
   };
 }
 
@@ -260,4 +306,125 @@ test('a stale failed listing cannot replace the newer directory with an error', 
     ['a/'],
     'a stale failure must not replace the current listing',
   );
+});
+
+const decisionAsked = {
+  type: 'decision_asked',
+  id: 'd1',
+  question: 'Overwrite notes.txt?',
+};
+
+test('a failed answer reopens the dialog and keeps the Confirmation retryable', async () => {
+  const app = makeApp();
+  await app.ready();
+  app.emit(decisionAsked);
+  assert.equal(app.dialogOpen(), true);
+  assert.equal(app.question(), 'Overwrite notes.txt?');
+
+  app.clickById('allow');
+  const failed = await app.takeAnswer();
+  assert.equal(failed.url, '/api/decision/d1');
+  assert.deepEqual(JSON.parse(failed.options.body), { allow: true });
+  failed.resolve(errorResponse(500));
+  await flush();
+
+  assert.equal(app.dialogOpen(), true, 'the dialog reopens so the user can retry');
+  assert.equal(app.decisionErrorHidden(), false, 'the dialog explains the failure');
+  assert.match(app.decisionError(), /500/);
+
+  app.clickById('deny');
+  const retry = await app.takeAnswer();
+  assert.equal(retry.url, '/api/decision/d1');
+  assert.deepEqual(JSON.parse(retry.options.body), { allow: false });
+  retry.resolve(acceptedResponse());
+  await flush();
+
+  assert.equal(app.dialogOpen(), false);
+  assert.equal(app.decisionErrorHidden(), true);
+  assert.equal(app.pendingAnswers(), 0);
+});
+
+test('a rejected answer request reopens the dialog for a retry', async () => {
+  const app = makeApp();
+  await app.ready();
+  app.emit(decisionAsked);
+
+  app.clickById('allow');
+  const failed = await app.takeAnswer();
+  failed.reject(new TypeError('fetch failed'));
+  await flush();
+
+  assert.equal(app.dialogOpen(), true, 'the decision survives a network failure');
+  assert.equal(app.decisionErrorHidden(), false);
+  assert.match(app.decisionError(), /reach/i);
+
+  app.clickById('allow');
+  const retry = await app.takeAnswer();
+  retry.resolve(acceptedResponse());
+  await flush();
+  assert.equal(app.dialogOpen(), false);
+  assert.equal(app.decisionErrorHidden(), true);
+});
+
+test('a 404 answer is terminal: the dialog closes and the Confirmation is not retried', async () => {
+  const app = makeApp();
+  await app.ready();
+  app.emit(decisionAsked);
+
+  app.clickById('allow');
+  const request = await app.takeAnswer();
+  request.resolve(errorResponse(404));
+  await flush();
+
+  assert.equal(app.dialogOpen(), false, 'a lost response must not leave a stuck dialog');
+  assert.equal(app.decisionErrorHidden(), true);
+  assert.ok(
+    app.lines().some((line) => /no longer pending/i.test(line)),
+    'the transcript says why the Confirmation went away',
+  );
+
+  app.clickById('allow');
+  await flush();
+  assert.equal(app.pendingAnswers(), 0, 'a terminal answer is not retried');
+});
+
+test('a successful answer clears the Confirmation and closes the dialog', async () => {
+  const app = makeApp();
+  await app.ready();
+  app.emit(decisionAsked);
+
+  app.clickById('allow');
+  const request = await app.takeAnswer();
+  request.resolve(acceptedResponse());
+  await flush();
+
+  assert.equal(app.dialogOpen(), false);
+  assert.equal(app.decisionErrorHidden(), true);
+
+  app.clickById('allow');
+  await flush();
+  assert.equal(app.pendingAnswers(), 0, 'an answered Confirmation is not sent twice');
+});
+
+test('decision_answered still resolves a dialog that a failed POST reopened', async () => {
+  const app = makeApp();
+  await app.ready();
+  app.emit(decisionAsked);
+
+  app.clickById('allow');
+  const failed = await app.takeAnswer();
+  failed.resolve(errorResponse(500));
+  await flush();
+  assert.equal(app.dialogOpen(), true);
+
+  app.emit({ type: 'decision_answered', id: 'd1', allow: true, timed_out: false });
+  await flush();
+
+  assert.equal(app.dialogOpen(), false, 'the server event closes the dialog');
+  assert.equal(app.decisionErrorHidden(), true);
+  assert.ok(app.lines().some((line) => line.includes('Confirmation approved.')));
+
+  app.clickById('allow');
+  await flush();
+  assert.equal(app.pendingAnswers(), 0, 'the resolved Confirmation is not retried');
 });

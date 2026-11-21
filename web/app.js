@@ -9,6 +9,7 @@ const runButton = $('#run');
 const taskInput = $('#task');
 const decisionDialog = $('#decision');
 const decisionQuestion = $('#decision-question');
+const decisionError = $('#decision-error');
 const fileView = $('#file-view');
 
 let running = false;
@@ -96,9 +97,21 @@ function addObservation(event) {
   }
 }
 
+function clearDecisionError() {
+  decisionError.textContent = '';
+  decisionError.hidden = true;
+}
+
+function showDecisionError(message) {
+  decisionError.textContent = message;
+  decisionError.hidden = false;
+  if (!decisionDialog.open) decisionDialog.showModal();
+}
+
 function askDecision(event) {
   currentDecision = event.id;
   decisionQuestion.textContent = event.question;
+  clearDecisionError();
   appendLine('decision', 'Waiting for a Confirmation…');
   if (!decisionDialog.open) decisionDialog.showModal();
 }
@@ -107,6 +120,7 @@ function resolveDecision(event) {
   if (currentDecision === event.id) {
     currentDecision = null;
     if (decisionDialog.open) decisionDialog.close();
+    clearDecisionError();
   }
   if (event.timed_out) {
     appendLine('decision', 'Confirmation timed out; answered deny.');
@@ -170,13 +184,38 @@ function handleEvent(event) {
 async function answerDecision(allow) {
   const id = currentDecision;
   if (!id) return;
-  currentDecision = null;
   if (decisionDialog.open) decisionDialog.close();
-  await fetch(`/api/decision/${encodeURIComponent(id)}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ allow }),
-  });
+  try {
+    const response = await fetch(`/api/decision/${encodeURIComponent(id)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ allow }),
+    });
+    if (response.ok) {
+      if (currentDecision === id) currentDecision = null;
+      clearDecisionError();
+      return;
+    }
+    if (response.status === 404) {
+      // Already answered or no longer pending: the server will never accept
+      // this Confirmation, so stop waiting instead of leaving the dialog stuck.
+      if (currentDecision === id) {
+        currentDecision = null;
+        if (decisionDialog.open) decisionDialog.close();
+        appendLine('decision', 'This Confirmation is no longer pending.');
+      }
+      clearDecisionError();
+      return;
+    }
+    // The Confirmation stays pending so the user can answer it again.
+    if (currentDecision === id) {
+      showDecisionError(`Could not answer the Confirmation (${response.status}). Please try again.`);
+    }
+  } catch {
+    if (currentDecision === id) {
+      showDecisionError('Could not reach the server. The Confirmation is still waiting; please try again.');
+    }
+  }
 }
 
 async function submitTask(task) {
