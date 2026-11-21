@@ -197,8 +197,9 @@ async function answerDecision(allow) {
       return;
     }
     if (response.status === 404) {
-      // Already answered or no longer pending: the server will never accept
-      // this Confirmation, so stop waiting instead of leaving the dialog stuck.
+      // A 404 is terminal: the hub has already dropped this pending
+      // Confirmation, so a retry can never succeed. Stop waiting instead of
+      // leaving the dialog stuck.
       if (currentDecision === id) {
         currentDecision = null;
         if (decisionDialog.open) decisionDialog.close();
