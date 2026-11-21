@@ -129,6 +129,14 @@ const errorResponse = (status) => ({
   json: async () => ({}),
   text: async () => '',
 });
+const invalidJsonResponse = () => ({
+  ok: true,
+  status: 200,
+  json: async () => {
+    throw new SyntaxError('Unexpected token < in JSON at position 0');
+  },
+  text: async () => '',
+});
 const acceptedResponse = () => ({
   ok: true,
   status: 204,
@@ -136,7 +144,7 @@ const acceptedResponse = () => ({
   text: async () => '',
 });
 
-function makeApp() {
+function makeApp({ state, audit, workspace } = {}) {
   eventSources = [];
   const byId = new Map(IDS.map((id) => [id, new FakeElement('div')]));
   const elements = {
@@ -160,14 +168,17 @@ function makeApp() {
   const answers = [];
   elements.fetch = (url, options = {}) => {
     if (url === '/api/state') {
-      return Promise.resolve(okResponse({ model: 'test', running: false }));
+      return state ? state() : Promise.resolve(okResponse({ model: 'test', running: false }));
     }
-    if (url === '/api/audit') return Promise.resolve(okResponse([]));
+    if (url === '/api/audit') {
+      return audit ? audit() : Promise.resolve(okResponse([]));
+    }
     if (url.startsWith('/api/decision/')) {
       return new Promise((resolve, reject) => answers.push({ url, options, resolve, reject }));
     }
     assert.match(url, /^\/api\/workspace\?path=/);
     const path = new URL(url, 'http://localhost').searchParams.get('path') || '';
+    if (workspace) return workspace(path);
     return new Promise((resolve) => pending.push({ path, resolve }));
   };
 
@@ -233,6 +244,9 @@ function makeApp() {
     decisionErrorHidden: () => byId.get('decision-error').hidden,
     lines: () => byId.get('transcript').children.map((line) => line.textContent),
     pendingAnswers: () => answers.length,
+    eventSourceCount: () => eventSources.length,
+    status: () => byId.get('status').textContent,
+    model: () => byId.get('model').textContent,
   };
 }
 
@@ -427,4 +441,59 @@ test('decision_answered still resolves a dialog that a failed POST reopened', as
   app.clickById('allow');
   await flush();
   assert.equal(app.pendingAnswers(), 0, 'the resolved Confirmation is not retried');
+});
+
+test('a rejected state request still connects the event stream and shows status', async () => {
+  const app = makeApp({
+    state: () => Promise.reject(new TypeError('fetch failed')),
+    workspace: () => Promise.resolve(okResponse([])),
+  });
+
+  await flush();
+
+  assert.equal(app.eventSourceCount(), 1, 'the stream connects even when state loading fails');
+  assert.equal(app.status(), 'idle');
+
+  app.emit({ type: 'task_started', task: 'repair the tests' });
+  assert.equal(app.status(), 'running', 'events still drive the page');
+  assert.ok(app.lines().some((line) => line.includes('Task: repair the tests')));
+});
+
+test('an invalid state payload still connects the event stream and shows status', async () => {
+  const app = makeApp({
+    state: () => Promise.resolve(invalidJsonResponse()),
+    workspace: () => Promise.resolve(okResponse([])),
+  });
+
+  await flush();
+
+  assert.equal(app.eventSourceCount(), 1, 'invalid JSON must not keep the stream closed');
+  assert.equal(app.status(), 'idle');
+  assert.equal(app.model(), '', 'no model is rendered from an unreadable state');
+});
+
+test('a rejected panel request still connects the event stream and renders state', async () => {
+  const app = makeApp({
+    audit: () => Promise.reject(new TypeError('fetch failed')),
+    workspace: () => Promise.resolve(okResponse([])),
+  });
+
+  await flush();
+
+  assert.equal(app.eventSourceCount(), 1, 'a failed panel must not keep the stream closed');
+  assert.equal(app.status(), 'idle');
+  assert.equal(app.model(), 'test', 'the readable state is still rendered');
+});
+
+test('the happy path renders the model, running status, and event stream', async () => {
+  const app = makeApp({
+    state: () => Promise.resolve(okResponse({ model: 'happy-model', running: true })),
+    workspace: () => Promise.resolve(okResponse([])),
+  });
+
+  await flush();
+
+  assert.equal(app.eventSourceCount(), 1);
+  assert.equal(app.model(), 'happy-model');
+  assert.equal(app.status(), 'running');
 });
