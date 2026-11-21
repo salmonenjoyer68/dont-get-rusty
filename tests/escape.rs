@@ -62,9 +62,17 @@ fn guest_cannot_write_through_the_workspace_preopen() {
     let sentinel = workspace.join("keep.txt");
     fs::write(&sentinel, "keep me\n").unwrap();
 
-    let result = run("open('/workspace/../x', 'w').write('pwned')", &workspace);
+    let result = run(
+        "print(open('/workspace/keep.txt').read(), end='')\nopen('/workspace/../x', 'w').write('pwned')",
+        &workspace,
+    );
 
     assert_denied_by_the_guest(&result);
+    assert_eq!(
+        result.stdout, "keep me\n",
+        "the positive-control read must print the mounted /workspace/keep.txt; stderr: {}",
+        result.stderr
+    );
     assert!(
         !dir.path().join("x").exists(),
         "`/workspace/../x` escaped the read-only preopen"
@@ -86,9 +94,17 @@ fn guest_cannot_create_files_in_the_workspace() {
     let sentinel = dir.path().join("outside.txt");
     fs::write(&sentinel, "outside sentinel\n").unwrap();
 
-    let result = run("open('/workspace/x', 'w').write('pwned')", &workspace);
+    let result = run(
+        "print(open('/workspace/keep.txt').read(), end='')\nopen('/workspace/x', 'w').write('pwned')",
+        &workspace,
+    );
 
     assert_denied_by_the_guest(&result);
+    assert_eq!(
+        result.stdout, "keep me\n",
+        "the positive-control read must print the mounted /workspace/keep.txt; stderr: {}",
+        result.stderr
+    );
     assert!(
         !workspace.join("x").exists(),
         "the Guest created a file in the Workspace"
