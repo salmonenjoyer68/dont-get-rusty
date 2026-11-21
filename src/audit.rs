@@ -45,6 +45,10 @@
 //! appended: a fragment that is a complete serialized event is terminated, and
 //! an incomplete one is moved to `<audit.jsonl>.quarantine`, so the next event
 //! always starts on its own line.
+//!
+//! Repair and every append take an exclusive lock on the log file. Without it,
+//! a second process opening the same damaged log could truncate the tail while
+//! this one appends, deleting an event that was already written.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -239,7 +243,14 @@ impl AuditLog {
         // during a later repair, and by then it is too late to refuse startup.
         refuse_special(&quarantine)?;
         let mut file = open_append_nofollow(&path)?;
-        repair_unterminated_tail(&path, &quarantine, &mut file)?;
+        // The repair reads the final record and then truncates it. An event
+        // appended in that window would be cut off with the fragment, so the
+        // lock is held across both steps and every append takes it too.
+        lock_exclusive(&file, &path)?;
+        let repaired = repair_unterminated_tail(&path, &quarantine, &mut file);
+        let released = unlock(&file, &path);
+        repaired?;
+        released?;
         Ok(Self {
             quarantine,
             path,
@@ -285,6 +296,9 @@ impl AuditLog {
     }
 
     /// Appends `event` as one JSON line and flushes it.
+    ///
+    /// The write holds the log lock, so a concurrent repair cannot truncate
+    /// the event when it cuts the damaged tail off.
     pub fn record_event(&self, event: &AuditEvent) -> Result<(), AuditError> {
         let mut line =
             serde_json::to_string(event).map_err(|source| AuditError::Encode { source })?;
@@ -293,12 +307,17 @@ impl AuditLog {
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        file.write_all(line.as_bytes())
+        lock_exclusive(&file, &self.path)?;
+        let written = file
+            .write_all(line.as_bytes())
             .and_then(|()| file.flush())
             .map_err(|source| AuditError::Write {
                 path: self.path.clone(),
                 source,
-            })
+            });
+        let released = unlock(&file, &self.path);
+        written?;
+        released
     }
 }
 
@@ -340,6 +359,28 @@ fn open_append_nofollow(path: &Path) -> Result<File, AuditError> {
         });
     }
     Ok(file)
+}
+
+/// Takes the exclusive lock on `file`, blocking until it is free.
+///
+/// The lock belongs to the open file description, so it excludes another
+/// process and another handle in this process (each handle opens its own
+/// description). Both critical sections are short — one append, or one tail
+/// read and truncation — and the kernel drops the lock when the handle is
+/// closed, so blocking cannot outlive a crashed peer.
+fn lock_exclusive(file: &File, path: &Path) -> Result<(), AuditError> {
+    file.lock().map_err(|source| AuditError::Lock {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Releases the lock [`lock_exclusive`] took.
+fn unlock(file: &File, path: &Path) -> Result<(), AuditError> {
+    file.unlock().map_err(|source| AuditError::Lock {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Open options shared by the log and its quarantine file: append, create, and
@@ -583,6 +624,12 @@ pub enum AuditError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to lock audit log `{path}`")]
+    Lock {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to encode an audit event")]
     Encode {
         #[source]
@@ -600,4 +647,106 @@ pub enum AuditError {
         #[source]
         source: io::Error,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Opens a second handle on `path` and takes the log lock, the way a
+    /// competing process does, so a test can prove an operation waits for it.
+    fn hold_lock(path: &Path) -> File {
+        let holder = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .expect("the test should open the log");
+        holder.lock().expect("the test should take the log lock");
+        holder
+    }
+
+    #[test]
+    fn opening_a_damaged_log_waits_for_the_log_lock() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(FILE);
+        std::fs::write(&path, "{\"complete\":true}\n{\"partial\"").expect("a damaged log");
+
+        let holder = hold_lock(&path);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            started_tx.send(()).expect("the test should be listening");
+            let log = AuditLog::at(&path);
+            let _ = opened_tx.send(());
+            log.map(|_| ())
+        });
+
+        started_rx.recv().expect("the opener should start");
+        assert!(
+            opened_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "opening must wait for the lock before it reads and truncates the tail"
+        );
+        holder
+            .unlock()
+            .expect("the test should release the log lock");
+        opened_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("opening should finish once the lock is free");
+        opener
+            .join()
+            .expect("the opener should not panic")
+            .expect("the log should open");
+    }
+
+    #[test]
+    fn appending_waits_for_the_log_lock() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(FILE);
+        std::fs::write(&path, "").expect("an empty log");
+        let log = AuditLog::at(&path).expect("the log should open");
+        let holder = hold_lock(&path);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (appended_tx, appended_rx) = mpsc::channel();
+        let appender = std::thread::spawn(move || {
+            started_tx.send(()).expect("the test should be listening");
+            let result = log.record(
+                0,
+                &ToolCall::new("call", "list_files", "{}".to_owned()),
+                &Decision::Allow,
+                &Observation::from_text("list_files", "README.md"),
+                1,
+            );
+            let _ = appended_tx.send(());
+            result
+        });
+
+        started_rx.recv().expect("the appender should start");
+        assert!(
+            appended_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "an append must wait for the lock a repair holds"
+        );
+        holder
+            .unlock()
+            .expect("the test should release the log lock");
+        appended_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the append should finish once the lock is free");
+        appender
+            .join()
+            .expect("the appender should not panic")
+            .expect("the event should be recorded");
+        let text = std::fs::read_to_string(&path).expect("the log should be readable");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "exactly one complete event: {text}"
+        );
+        assert!(text.ends_with('\n'), "the event ends its own line: {text}");
+    }
 }

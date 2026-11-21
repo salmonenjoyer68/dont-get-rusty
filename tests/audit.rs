@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
 
 use async_trait::async_trait;
 use dont_get_rusty::agent::{
@@ -647,6 +648,67 @@ fn a_partial_record_larger_than_one_tail_read_is_still_quarantined() {
         fs::read_to_string(log.quarantine_path()).expect("quarantine should be readable"),
         format!("{fragment}\n"),
         "the whole partial record is preserved, not just the last chunk"
+    );
+}
+
+#[test]
+fn concurrent_opens_repair_the_tail_once_and_keep_every_appended_event() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    log.record(
+        0,
+        &ToolCall::new("first", "list_files", "{}".to_owned()),
+        &Decision::Allow,
+        &Observation::from_text("list_files", "README.md"),
+        1,
+    )
+    .expect("the first event should be appended");
+    let path = log.path().to_path_buf();
+    let quarantine = log.quarantine_path().to_path_buf();
+    drop(log);
+
+    let complete = fs::read_to_string(&path).expect("the log should be readable");
+    let fragment = "{\"ts\":\"2026-11-21T00:00:00Z\",\"tool\":\"read_fi";
+    fs::write(&path, format!("{complete}{fragment}")).expect("a failed append should be simulated");
+
+    // Each thread opens the same damaged log and appends one event. Repair
+    // reads the tail and then truncates it; without a lock covering both, an
+    // event appended between those steps is cut off with the fragment.
+    let threads: Vec<_> = (0..4)
+        .map(|step| {
+            let path = path.clone();
+            thread::spawn(move || {
+                let log = AuditLog::at(&path).expect("the damaged log should open");
+                log.record(
+                    step,
+                    &ToolCall::new(
+                        "later",
+                        "read_file",
+                        json!({ "path": "README.md" }).to_string(),
+                    ),
+                    &Decision::Allow,
+                    &Observation::from_text("read_file", "hello"),
+                    1,
+                )
+                .expect("the event should be appended");
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("no thread should panic");
+    }
+
+    let events = events(&path);
+    assert_eq!(
+        events.len(),
+        5,
+        "every event survives the repair race: {events:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&quarantine).expect("the quarantine should be readable"),
+        format!("{fragment}\n"),
+        "the fragment is quarantined exactly once, not once per opener"
     );
 }
 
