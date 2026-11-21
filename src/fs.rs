@@ -224,8 +224,17 @@ impl Workspace {
     }
 
     /// Reads a regular file (or an in-workspace symlink's target) entirely.
+    ///
+    /// The target type is checked before the file is opened. Opening a FIFO or
+    /// another non-regular file can block indefinitely, so those targets are
+    /// rejected with [`FsError::NotAFile`]. Symlink resolution stays with
+    /// `cap-std`: an in-workspace link to a regular file reads normally, a link
+    /// to a directory is not a file, and a link that escapes is denied.
     pub fn read_file(&self, path: impl AsRef<Path>) -> Result<Vec<u8>, FsError> {
         let rel = resolve_target(path.as_ref())?;
+        if !self.root.metadata(&rel)?.is_file() {
+            return Err(FsError::NotAFile);
+        }
         Ok(self.root.read(rel)?)
     }
 
