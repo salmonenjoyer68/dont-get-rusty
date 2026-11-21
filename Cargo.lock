@@ -644,6 +644,7 @@ dependencies = [
  "cap-std",
  "clap",
  "futures-core",
+ "libc",
  "proptest",
  "rand",
  "reqwest",

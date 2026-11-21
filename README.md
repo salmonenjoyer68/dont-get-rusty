@@ -124,10 +124,14 @@ would exceed it creates and truncates nothing.
 
 Every Tool Call appends exactly one JSON line to `<cwd>/.agent/audit.jsonl`,
 which lives outside the Workspace so neither the Guest nor the model can read
-it. An event records the timestamp, session id, Step, tool, a SHA-256 of the
-full arguments, the redacted argument prefix, the decision, exit code, output
-byte counts, truncation flag, and duration. `code`, `content`, and `stdin` are
-replaced by `<omitted: N bytes>` markers, so bodies never reach the log.
+it. The log (and its `.quarantine` companion) must be a regular file: startup
+refuses a symlinked path rather than following it, even when the link resolves
+outside the Workspace, so a link cannot redirect audit records into the
+Workspace. An event records the timestamp, session id, Step, tool, a SHA-256 of
+the full arguments, the redacted argument prefix, the decision, exit code,
+output byte counts, truncation flag, and duration. `code`, `content`, and
+`stdin` are replaced by `<omitted: N bytes>` markers, so bodies never reach the
+log.
 
 An append that fails halfway can leave an unterminated final record. Opening
 the log validates that tail: a complete event missing only its newline is

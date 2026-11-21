@@ -303,6 +303,159 @@ fn a_log_inside_the_workspace_is_refused() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_symlinked_log_into_the_workspace_is_refused_and_leaves_its_target_untouched() {
+    use std::os::unix::fs::symlink;
+
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let agent_dir = cwd.path().join(".agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    let target = workspace.path().join("audit.jsonl");
+    let sentinel = "workspace file the model can read\n";
+    fs::write(&target, sentinel).unwrap();
+    symlink(&target, agent_dir.join("audit.jsonl")).unwrap();
+
+    let error = AuditLog::open(cwd.path(), workspace.path())
+        .expect_err("a log that resolves into the Workspace must be refused");
+
+    assert!(
+        matches!(error, AuditError::Symlink { .. }),
+        "the refusal names the symlink: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("symlink"),
+        "the error explains the problem: {error}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        sentinel,
+        "a refused start must not append audit records to the Workspace"
+    );
+    assert!(
+        agent_dir
+            .join("audit.jsonl")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a refused start must not replace the symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_log_outside_the_workspace_is_refused_too() {
+    use std::os::unix::fs::symlink;
+
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let agent_dir = cwd.path().join(".agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    let target = outside.path().join("audit.jsonl");
+    let sentinel = "audit records must not be redirected\n";
+    fs::write(&target, sentinel).unwrap();
+    symlink(&target, agent_dir.join("audit.jsonl")).unwrap();
+
+    let error = AuditLog::open(cwd.path(), workspace.path())
+        .expect_err("a symlinked log is refused even when it resolves outside the Workspace");
+
+    assert!(
+        matches!(error, AuditError::Symlink { .. }),
+        "the refusal names the symlink: {error:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        sentinel,
+        "the redirect target is untouched"
+    );
+    assert!(
+        !agent_dir.join("audit.jsonl.quarantine").exists(),
+        "no repair may run through the refused path"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_quarantine_file_is_refused_and_leaves_its_target_untouched() {
+    use std::os::unix::fs::symlink;
+
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    let path = log.path().to_path_buf();
+    let quarantine = log.quarantine_path().to_path_buf();
+    drop(log);
+
+    // A failed append leaves an incomplete record that opening the log repairs.
+    let fragment = "{\"ts\":\"2026-11-21T00:00:00Z\",\"session\":\"deadbeef";
+    fs::write(&path, fragment).expect("the partial log should be written");
+    let target = workspace.path().join("quarantine.txt");
+    let sentinel = "workspace file the model can read\n";
+    fs::write(&target, sentinel).unwrap();
+    symlink(&target, &quarantine).unwrap();
+
+    let error = AuditLog::open(cwd.path(), workspace.path())
+        .expect_err("a quarantine that resolves into the Workspace must be refused");
+
+    assert!(
+        matches!(error, AuditError::Symlink { ref path } if path == &quarantine),
+        "the refusal names the symlinked quarantine: {error:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        sentinel,
+        "the repair must not write the fragment into the Workspace"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        fragment,
+        "the repair must not cut the log before it knows the fragment is safe"
+    );
+}
+
+#[test]
+fn a_regular_log_still_opens_and_appends() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    let path = log.path().to_path_buf();
+    log.record(
+        0,
+        &ToolCall::new("first", "list_files", "{}".to_owned()),
+        &Decision::Allow,
+        &Observation::from_text("list_files", "README.md"),
+        1,
+    )
+    .expect("the first event should be appended");
+    drop(log);
+
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should reopen");
+    log.record(
+        0,
+        &ToolCall::new(
+            "second",
+            "read_file",
+            json!({ "path": "README.md" }).to_string(),
+        ),
+        &Decision::Allow,
+        &Observation::from_text("read_file", "hello"),
+        1,
+    )
+    .expect("the next event should be appended");
+
+    let events = events(&path);
+    assert_eq!(events.len(), 2, "regular logs keep appending across opens");
+    assert_eq!(events[0]["tool"], json!("list_files"));
+    assert_eq!(events[1]["tool"], json!("read_file"));
+    assert!(
+        !log.quarantine_path().exists(),
+        "a healthy regular log needs no repair"
+    );
+}
+
 #[test]
 fn a_partial_final_record_is_quarantined_before_the_next_append() {
     let cwd = TempDir::new().unwrap();

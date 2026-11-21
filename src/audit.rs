@@ -28,6 +28,11 @@
 //! every completed event and at worst loses the one in flight. A write failure
 //! is an error, never a silently dropped event.
 //!
+//! The log and its quarantine file must be regular files: a symlinked final
+//! component is refused rather than followed, even when the link currently
+//! resolves outside the Workspace, because following it would let a link
+//! redirect host-written audit records into the Workspace.
+//!
 //! A write that fails halfway leaves part of a line at the end of the file.
 //! Opening the log repairs that tail before anything is appended: a fragment
 //! that is a complete serialized event is terminated, and an incomplete one is
@@ -154,8 +159,11 @@ impl AuditLog {
     /// first and the requested directory is made absolute lexically, so an
     /// inside-the-Workspace request is refused *before* `create_dir_all` touches
     /// the disk. After creation the directory is canonicalized again, so a
-    /// symlink that resolves into the Workspace is caught too. A refused start
-    /// leaves the Workspace exactly as it was.
+    /// symlink that resolves into the Workspace is caught too. The
+    /// `audit.jsonl` component itself must be a regular file: a symlinked log
+    /// is refused rather than followed, so it cannot resolve into the
+    /// Workspace after the directory check. A refused start leaves the
+    /// Workspace exactly as it was.
     pub fn open(cwd: &Path, workspace_root: &Path) -> Result<Self, AuditError> {
         let requested = cwd.join(DIR);
         let dir = std::path::absolute(&requested).map_err(|source| AuditError::Resolve {
@@ -203,20 +211,16 @@ impl AuditLog {
     /// Opens the log at `path`, appending to any existing file.
     ///
     /// The parent directory must exist; [`AuditLog::open`] creates `.agent/`
-    /// and enforces the outside-the-Workspace rule. An unterminated final
-    /// record left by a failed append is repaired before the log is returned,
-    /// so the next event cannot merge into the fragment.
+    /// and enforces the outside-the-Workspace rule. A final component that is
+    /// a symlink is refused rather than followed, even when it currently
+    /// resolves outside the Workspace, because a link could otherwise redirect
+    /// audit records into the Workspace. The quarantine file is subject to the
+    /// same rule. An unterminated final record left by a failed append is
+    /// repaired before the log is returned, so the next event cannot merge into
+    /// the fragment.
     pub fn at(path: impl Into<PathBuf>) -> Result<Self, AuditError> {
         let path = path.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|source| AuditError::Open {
-                path: path.clone(),
-                source,
-            })?;
+        let mut file = open_append_nofollow(&path)?;
         repair_unterminated_tail(&path, &mut file)?;
         Ok(Self {
             quarantine: quarantine_path(&path),
@@ -286,6 +290,57 @@ impl AuditLog {
 /// every event.
 static SESSION: LazyLock<String> = LazyLock::new(|| format!("{:016x}", rand::random::<u64>()));
 
+/// Opens `path` for appending without following a symlinked final component.
+///
+/// A symlink is refused even when it currently resolves outside the Workspace:
+/// the Audit Log is a regular file the process creates and owns, and following
+/// a link would reopen the path for redirection after the Workspace check.
+/// On Unix, `O_NOFOLLOW` closes the window between the metadata check and the
+/// open, so a link planted in that window is refused by the kernel too.
+fn open_append_nofollow(path: &Path) -> Result<File, AuditError> {
+    refuse_symlink(path)?;
+    append_options()
+        .read(true)
+        .open(path)
+        .map_err(|source| AuditError::Open {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Open options shared by the log and its quarantine file: append, create, and
+/// never follow a symlinked final component.
+fn append_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+}
+
+/// Refuses a path whose final component is a symlink.
+///
+/// Resolving the link instead would let a host actor redirect host-written
+/// audit records somewhere they are not meant to go, including into the
+/// Workspace where the model can read them. Refusing every symlink keeps the
+/// rule independent of the link's current target.
+fn refuse_symlink(path: &Path) -> Result<(), AuditError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(AuditError::Symlink {
+            path: path.to_path_buf(),
+        }),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AuditError::Open {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// The path where a fragment moved out of `path` is preserved.
 fn quarantine_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -324,14 +379,16 @@ fn repair_unterminated_tail(path: &Path, file: &mut File) -> Result<(), AuditErr
     }
 
     let quarantine = quarantine_path(path);
-    let mut quarantined = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&quarantine)
-        .map_err(|source| AuditError::Repair {
-            path: quarantine.clone(),
-            source,
-        })?;
+    // The quarantine file holds audit bytes too, so it is subject to the same
+    // no-symlink rule as the log itself.
+    refuse_symlink(&quarantine)?;
+    let mut quarantined =
+        append_options()
+            .open(&quarantine)
+            .map_err(|source| AuditError::Repair {
+                path: quarantine.clone(),
+                source,
+            })?;
     quarantined
         .write_all(&fragment)
         .and_then(|()| quarantined.write_all(b"\n"))
@@ -470,6 +527,11 @@ pub enum AuditError {
          the Workspace so the Guest and the model cannot read it"
     )]
     InsideWorkspace { path: PathBuf, workspace: PathBuf },
+    #[error(
+        "audit log path `{path}` is a symlink; the Audit Log and its quarantine file must be \
+         regular files so they cannot resolve into the Workspace"
+    )]
+    Symlink { path: PathBuf },
     #[error("failed to open audit log `{path}`")]
     Open {
         path: PathBuf,
