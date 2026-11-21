@@ -887,3 +887,160 @@ async fn a_declined_overwrite_keeps_the_policy_allow_and_records_an_error() {
         "a completed Guest Run with a non-zero exit records no host error"
     );
 }
+
+#[cfg(unix)]
+mod special_files {
+    use super::*;
+    use std::os::unix::fs::FileTypeExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Creates a FIFO with the platform `mkfifo` command.
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("`mkfifo` should be available on this platform");
+        assert!(status.success(), "mkfifo failed with {status}");
+    }
+
+    #[test]
+    fn a_fifo_log_is_refused_without_blocking() {
+        let cwd = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let agent_dir = cwd.path().join(".agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let fifo = agent_dir.join("audit.jsonl");
+        make_fifo(&fifo);
+
+        // Opening a FIFO used to succeed (or block, depending on the flags), so
+        // records could be swallowed with nothing persisted. Run the open on a
+        // worker so a regression fails here instead of hanging the suite.
+        let cwd_path = cwd.path().to_path_buf();
+        let workspace_path = workspace.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                AuditLog::open(&cwd_path, &workspace_path).map(|log| log.path().to_path_buf());
+            let _ = sender.send(result);
+        });
+
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(Err(error)) => {
+                assert!(
+                    error.to_string().contains("regular file"),
+                    "the refusal must explain that the log must be a regular file: {error}"
+                );
+                assert!(
+                    !matches!(error, AuditError::Symlink { .. }),
+                    "a FIFO is not a symlink: {error:?}"
+                );
+            }
+            Ok(Ok(path)) => panic!("a FIFO log must be refused, but it opened at {path:?}"),
+            Err(_) => panic!("opening a FIFO log blocked instead of refusing it"),
+        }
+        assert!(
+            fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+            "a refused start must not replace the FIFO"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_quarantine_file_with_a_clean_tail_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+        log.record(
+            0,
+            &ToolCall::new("first", "list_files", "{}".to_owned()),
+            &Decision::Allow,
+            &Observation::from_text("list_files", "README.md"),
+            1,
+        )
+        .expect("an allowed event should be appended");
+        let path = log.path().to_path_buf();
+        let quarantine = log.quarantine_path().to_path_buf();
+        let clean = fs::read_to_string(&path).expect("audit log should be readable");
+        drop(log);
+        assert!(
+            clean.ends_with('\n'),
+            "the log tail is clean, so no repair is due"
+        );
+
+        let target = workspace.path().join("quarantine.txt");
+        let sentinel = "workspace file the model can read\n";
+        fs::write(&target, sentinel).unwrap();
+        symlink(&target, &quarantine).unwrap();
+
+        let error = AuditLog::open(cwd.path(), workspace.path())
+            .expect_err("a symlinked quarantine must be refused even when the log tail is clean");
+
+        assert!(
+            matches!(error, AuditError::Symlink { ref path } if path == &quarantine),
+            "the refusal names the symlinked quarantine: {error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            sentinel,
+            "a refused start must not write through the quarantine link"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            clean,
+            "a refused start must not touch the clean log"
+        );
+    }
+
+    #[test]
+    fn a_fifo_quarantine_file_is_refused_without_blocking() {
+        let cwd = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+        log.record(
+            0,
+            &ToolCall::new("first", "list_files", "{}".to_owned()),
+            &Decision::Allow,
+            &Observation::from_text("list_files", "README.md"),
+            1,
+        )
+        .expect("an allowed event should be appended");
+        let quarantine = log.quarantine_path().to_path_buf();
+        drop(log);
+        make_fifo(&quarantine);
+
+        let cwd_path = cwd.path().to_path_buf();
+        let workspace_path = workspace.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                AuditLog::open(&cwd_path, &workspace_path).map(|log| log.path().to_path_buf());
+            let _ = sender.send(result);
+        });
+
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(Err(error)) => {
+                assert!(
+                    error.to_string().contains("regular file"),
+                    "the refusal must explain that the quarantine must be a regular file: {error}"
+                );
+                assert!(
+                    !matches!(error, AuditError::Symlink { .. }),
+                    "a FIFO is not a symlink: {error:?}"
+                );
+            }
+            Ok(Ok(path)) => panic!(
+                "a FIFO quarantine must be refused even on a clean tail, but the log opened at {path:?}"
+            ),
+            Err(_) => panic!("opening a FIFO quarantine blocked instead of refusing it"),
+        }
+        assert!(
+            fs::symlink_metadata(&quarantine)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "a refused start must not replace the FIFO"
+        );
+    }
+}
