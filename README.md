@@ -129,6 +129,12 @@ full arguments, the redacted argument prefix, the decision, exit code, output
 byte counts, truncation flag, and duration. `code`, `content`, and `stdin` are
 replaced by `<omitted: N bytes>` markers, so bodies never reach the log.
 
+An append that fails halfway can leave an unterminated final record. Opening
+the log validates that tail: a complete event missing only its newline is
+terminated, and an incomplete fragment is moved to
+`<cwd>/.agent/audit.jsonl.quarantine` before the next event is written, so one
+event never merges into another. Complete records are never rewritten.
+
 `decision`/`denial_reason` are the Policy verdict only. A call the Policy
 allowed but that failed on the host (quota, escape, overwrite decline,
 malformed arguments, Sandbox setup) stays `allow` and records the host-side

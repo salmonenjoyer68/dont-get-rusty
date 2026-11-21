@@ -271,6 +271,8 @@ Append-only JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Gues
 
 Args are truncated to 2 KiB plus a SHA-256 of the full payload; code, file contents, and piped `stdin` are never stored.
 
+A failed append can leave an unterminated final record. Opening the log validates that tail first: a complete event missing only its newline is terminated, and an incomplete fragment is moved to `audit.jsonl.quarantine` before the next event is written. Bytes belonging to complete records are never rewritten.
+
 `decision`/`denial_reason` are the Policy verdict only: `deny` with a reason for a Policy refusal, `allow` otherwise. A call the Policy allowed but that failed on the host (quota, escape, overwrite decline, malformed arguments, Sandbox setup) stays `allow` and records the host-side message in the optional `error` field; a Policy denial has `denial_reason` and no `error`. A Guest Run records `allow` even when its exit code is non-zero: the Guest ran, and the exit code is the result. Output byte counts are totals produced before truncation.
 
 ## Tests
