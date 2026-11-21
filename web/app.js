@@ -345,14 +345,20 @@ decisionDialog.addEventListener('cancel', (event) => {
 });
 
 async function load() {
-  const response = await fetch('/api/state');
-  if (response.ok) {
-    const state = await response.json();
-    $('#model').textContent = state.model;
-    running = state.running;
+  try {
+    const response = await fetch('/api/state');
+    if (response.ok) {
+      const state = await response.json();
+      $('#model').textContent = state.model;
+      running = state.running;
+    }
+  } catch {
+    // The state is only a hint for the initial render; an unreachable or
+    // malformed response must not keep the EventSource from opening.
   }
   setStatus();
-  await Promise.all([refreshWorkspace(''), refreshAudit()]);
+  // Either panel may fail independently; neither may block the event stream.
+  await Promise.allSettled([refreshWorkspace(''), refreshAudit()]);
   connect();
 }
 

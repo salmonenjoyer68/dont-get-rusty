@@ -21,7 +21,10 @@
 //! - if the system prompt and task alone exceed the budget, every Observation
 //!   is stubbed and the view still exceeds the budget;
 //! - stubs are emitted even after the budget is spent, so the view may exceed
-//!   the budget by at most the size of those stubs.
+//!   the budget by at most [`MAX_STUB_CHARS`] per stubbed Observation for the
+//!   built-in tool names. The first stderr line and host-side error are each
+//!   capped at [`MAX_STUB_FIELD_CHARS`] characters, so a stub cannot grow with
+//!   the 64 KiB the Sandbox may retain per stream.
 //!
 //! # Selection, newest first
 //!
@@ -34,7 +37,8 @@
 //!    marker;
 //! 3. every Observation that does not fit is stubbed to its tool name, exit
 //!    code, stdout/stderr byte counts, first stderr line, and — for a failed
-//!    Tool Call — its host-side error message; this includes the newest
+//!    Tool Call — its host-side error message; the stderr line and error keep
+//!    at most [`MAX_STUB_FIELD_CHARS`] characters. This includes the newest
 //!    Observation when even the marker leaves no room for its text;
 //! 4. stubs keep being emitted after the budget is spent.
 //!
@@ -45,6 +49,18 @@
 
 use crate::agent::Observation;
 use crate::llm::Message;
+
+/// Maximum characters copied from a stub's first stderr line or host error.
+///
+/// Both fields are signal, not bulk output: a couple of hundred characters are
+/// enough to say what failed, while keeping a stub far below the 64 KiB the
+/// Sandbox may retain per stream.
+pub const MAX_STUB_FIELD_CHARS: usize = 200;
+
+/// Upper bound on the characters one stub adds to the compacted view, for the
+/// built-in tool names: the fixed labels plus [`MAX_STUB_FIELD_CHARS`] from
+/// each capped field and its truncation marker.
+pub const MAX_STUB_CHARS: usize = 700;
 
 /// One history entry as the Agent Loop holds it.
 ///
@@ -159,7 +175,7 @@ fn stub(observation: &Observation, rendered_chars: usize) -> String {
     let mut out = String::new();
     out.push_str(&format!("tool: {}\n", observation.tool));
     if let Some(error) = &observation.error {
-        out.push_str(&format!("error: {error}\n"));
+        push_capped_field(&mut out, "error", error);
     }
     match observation.exit_code {
         Some(code) => out.push_str(&format!("exit_code: {code}\n")),
@@ -168,13 +184,31 @@ fn stub(observation: &Observation, rendered_chars: usize) -> String {
     out.push_str(&format!("stdout_bytes: {}\n", observation.stdout_bytes));
     out.push_str(&format!("stderr_bytes: {}\n", observation.stderr_bytes));
     match &observation.first_stderr_line {
-        Some(line) => out.push_str(&format!("first_stderr_line: {line}\n")),
+        Some(line) => push_capped_field(&mut out, "first_stderr_line", line),
         None => out.push_str("first_stderr_line: none\n"),
     }
     out.push_str(&format!(
         "--- [compacted Observation: {rendered_chars} characters omitted] ---\n"
     ));
     out
+}
+
+/// Appends one stub field, keeping at most [`MAX_STUB_FIELD_CHARS`] characters
+/// of `value` and naming how many were dropped.
+///
+/// Truncation is by `char`, never by byte, so a multi-byte character at the cap
+/// is never split.
+fn push_capped_field(out: &mut String, label: &str, value: &str) {
+    let total = value.chars().count();
+    if total <= MAX_STUB_FIELD_CHARS {
+        out.push_str(&format!("{label}: {value}\n"));
+        return;
+    }
+    let kept: String = value.chars().take(MAX_STUB_FIELD_CHARS).collect();
+    let omitted = total - MAX_STUB_FIELD_CHARS;
+    out.push_str(&format!(
+        "{label}: {kept} ... [{omitted} characters omitted]\n"
+    ));
 }
 
 /// Keeps the first and last characters of `content` around a marker naming how
