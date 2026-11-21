@@ -212,7 +212,7 @@ Non-streaming: one `/v1/chat/completions` request per Step, `tools` built from t
 `dont-get-rusty-web` (cargo feature `web`) serves the same Agent Loop to a localhost page. Scope is fixed by `docs/adr/0003-web-demo-scope.md`: loopback only, no auth, no CORS, one Task at a time.
 
 ```sh
-cargo run --features web --bin dont-get-rusty-web [--workspace DIR] [--policy FILE] [--port 7878]
+cargo run --features web --bin dont-get-rusty-web -- [--workspace DIR] [--policy FILE] [--port 7878]
 ```
 
 Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log session) over the shared `Sandbox` and `Chat`. A second submission while one runs gets `409`. There is no cancel button: a Task ends at its answer, its Step limit, or a dropped connection only when it reaches one.
