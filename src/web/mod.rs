@@ -13,5 +13,5 @@ pub mod decisions;
 pub mod hub;
 pub mod server;
 
-pub use hub::{DecisionKind, Event, Hub, HubObserver};
+pub use hub::{Change, DecisionKind, Event, Hub, HubObserver};
 pub use server::{AppState, router, serve, serve_on};

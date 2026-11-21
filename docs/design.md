@@ -228,7 +228,7 @@ Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log sessio
 | `GET /api/workspace/file?path=` | Read-only file view, capped at 64 KiB |
 | `GET /api/audit` | Last 200 Audit Events |
 
-The SSE stream is driven by a `Notify`-woken replay loop, not a broadcast channel: events are retained per Task, so a reconnect or a page loaded mid-Task replays from index 0 and cannot lose or reorder events. The cursor resets when a new Task clears the transcript.
+The SSE stream is driven by a `watch` generation counter, not a single-waiter `Notify`: each stream subscribes before reading the transcript, so a change landing between the read and the wait still wakes it, and every open tab wakes instead of racing for one wakeup. Events are retained per Task, so a reconnect or a page loaded mid-Task replays from index 0 and cannot lose or reorder events. The cursor resets when a new Task clears the transcript.
 
 Confirmations reuse the core's synchronous prompts: the Web Demo blocks the Agent's worker thread (`tokio::task::block_in_place`) on a channel until the page answers, with a 10-minute timeout answered `deny`. Every Step, Tool Call, and Observation is sent to the browser with its arguments and captured output; the Audit Log stays redacted.
 
