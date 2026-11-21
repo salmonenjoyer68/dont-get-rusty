@@ -61,7 +61,7 @@ pipeline never hangs.
 The same Agent Loop behind a localhost browser page:
 
 ```sh
-cargo run --features web --bin dont-get-rusty-web
+cargo run --features web --bin dont-get-rusty-web -- [--workspace DIR] [--policy FILE] [--port 7878]
 ```
 
 It serves `http://127.0.0.1:7878` (loopback only, no authentication, no CORS)

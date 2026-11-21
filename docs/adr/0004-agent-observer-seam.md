@@ -4,4 +4,4 @@
 
 Rejected: emitting into a `tokio::mpsc` channel (makes the core depend on runtime/event-bus semantics, and forces every caller to drain it); tailing the Audit Log in the front-end (cannot carry assistant text or arguments, by design); a callback closure parameter on `run` (would not fit the existing collaborator-injection style).
 
-Consequences: an Observer must return promptly and must not block, because it runs on the Agent's worker thread; anything slow is the implementation's job to move elsewhere. The trait is public, so adding a method later is a breaking change for external implementors.
+Consequences: an Observer must return promptly and must not block, because it runs on the Agent's worker thread; anything slow is the implementation's job to move elsewhere. Because the trait is public, a new method stays source-compatible for external implementors only if it carries a default body, as the four existing methods do; a required method would break every implementor.
