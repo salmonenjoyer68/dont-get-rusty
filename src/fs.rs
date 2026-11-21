@@ -10,11 +10,14 @@
 //!
 //! Writes enforce a total-size quota. The whole tree is summed and the target's
 //! current size subtracted *before* any directory is created or file truncated,
-//! so a denied write leaves the Workspace exactly as it was. The total is a
-//! snapshot: an external host process could change the tree between the scan
-//! and the write. That is acceptable for a single-user local CLI; it is not a
-//! defense against a concurrently hostile host process. The Guest's preopen is
-//! read-only (see [`crate::sandbox`]), so the Guest cannot race the scan either.
+//! so a denied write leaves the Workspace exactly as it was. A write whose
+//! parent path would nest deeper than the size scan can walk is refused before
+//! anything is created, so a write cannot leave a tree the scan cannot measure.
+//! The total is a snapshot: an external host process could change the tree
+//! between the scan and the write. That is acceptable for a single-user local
+//! CLI; it is not a defense against a concurrently hostile host process. The
+//! Guest's preopen is read-only (see [`crate::sandbox`]), so the Guest cannot
+//! race the scan either.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -26,7 +29,9 @@ use cap_std::fs::{Dir, OpenOptions};
 /// Default Workspace quota: 50 MB of regular-file bytes.
 pub const DEFAULT_QUOTA_BYTES: u64 = 50 * 1024 * 1024;
 
-/// Guards the recursive size scan against pathological nesting.
+/// Maximum depth the recursive size scan walks, counting the Workspace root as
+/// depth 0. A write may name at most this many parent directories: one more
+/// would make the tree unscannable.
 const MAX_DEPTH: u32 = 64;
 
 /// Why a model-supplied path was rejected before touching the filesystem.
@@ -235,9 +240,11 @@ impl Workspace {
     /// Writes `content`, enforcing the quota before touching the disk, and
     /// asks `confirm` before overwriting an existing file.
     ///
-    /// Every traversal, target-type, and quota check runs first. Only then is
-    /// `confirm` called with the Workspace-relative target; returning `false`
-    /// leaves the Workspace exactly as it was and yields
+    /// Every traversal, target-type, and quota check runs first. A write that
+    /// would create a tree deeper than the size scan can walk is refused with
+    /// [`FsError::TooDeep`], so it cannot make later operations fail. Only then
+    /// is `confirm` called with the Workspace-relative target; returning
+    /// `false` leaves the Workspace exactly as it was and yields
     /// [`FsError::OverwriteDeclined`]. `confirm` is never called for a target
     /// that did not exist, because creating a file destroys nothing.
     pub fn write_file_with_confirm(
@@ -247,6 +254,14 @@ impl Workspace {
         confirm: impl FnOnce(&Path) -> bool,
     ) -> Result<WriteInfo, FsError> {
         let rel = resolve_target(path.as_ref())?;
+
+        // Creating the parent path would add one directory per parent
+        // component. Refuse to create a tree the size scan cannot walk before
+        // any directory is made: such a tree would fail every later write.
+        let parent_depth = rel.parent().map_or(0, |parent| parent.components().count());
+        if parent_depth > MAX_DEPTH as usize {
+            return Err(FsError::TooDeep);
+        }
 
         let total = self.total_size()?;
         let existing = match self.root.metadata(&rel) {
