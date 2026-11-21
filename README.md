@@ -140,11 +140,16 @@ Output byte counts are totals produced before truncation.
 
 ```sh
 scripts/fetch-assets.sh          # once, needs network
+bash tests/fetch_assets_test.sh  # offline; fetch script manifest verification
 cargo test --offline             # ~3 minutes; the real CPython Guest runs
 cargo test --offline --features web   # adds the Web Demo routes
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+`tests/fetch_assets_test.sh` drives the fetch script's `checksums.txt`
+verification and refetch decision against temporary fake images with a stub
+`curl`, so it needs neither network nor a fetched `assets/` directory.
 
 The suite includes a consolidated escape suite against the real Guest
 (`tests/escape.rs`), an end-to-end CLI test that spawns the binary against a
