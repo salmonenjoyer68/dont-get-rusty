@@ -365,6 +365,73 @@ fn a_budget_with_no_room_stubs_the_newest_observation_instead_of_a_bare_marker()
 }
 
 #[test]
+fn a_huge_first_stderr_line_is_capped_in_the_stub() {
+    // About 64 KiB of stderr on one line. The multi-byte character sits where
+    // a naive byte-based truncation would split it.
+    let line = format!("{}{}{}", ".".repeat(199), "é", "x".repeat(64 * 1024));
+    assert!(line.len() > 64 * 1024);
+    let entries = vec![
+        HistoryEntry::Message(Message::system("system")),
+        HistoryEntry::Message(Message::user("task")),
+        HistoryEntry::Message(Message::assistant(None, vec![call("huge")])),
+        HistoryEntry::Observation {
+            tool_call_id: "huge".to_owned(),
+            observation: observation(2, "", &line),
+        },
+    ];
+
+    let messages = compact(&entries, 0);
+    let text = tool_content(&messages, "huge");
+
+    assert!(
+        text.chars().count() <= 700,
+        "a 64 KiB stderr line must not inflate the stub: {} characters",
+        text.chars().count()
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("first_stderr_line:") && line.contains("omitted")),
+        "the stub names how much of the oversized line it dropped: {text}"
+    );
+    assert!(
+        !text.contains(&"x".repeat(100)),
+        "the bulk of the oversized line must be dropped: {text}"
+    );
+}
+
+#[test]
+fn a_huge_host_error_is_capped_in_the_stub() {
+    let message = format!("denied: {}", "e".repeat(64 * 1024));
+    let entries = vec![
+        HistoryEntry::Message(Message::system("system")),
+        HistoryEntry::Message(Message::user("task")),
+        HistoryEntry::Message(Message::assistant(None, vec![call("denied")])),
+        HistoryEntry::Observation {
+            tool_call_id: "denied".to_owned(),
+            observation: Observation::error("run_code", message),
+        },
+    ];
+
+    let messages = compact(&entries, 0);
+    let text = tool_content(&messages, "denied");
+
+    assert!(
+        text.chars().count() <= 700,
+        "a 64 KiB host error must not inflate the stub: {} characters",
+        text.chars().count()
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("error:") && line.contains("omitted")),
+        "the stub names how much of the oversized error it dropped: {text}"
+    );
+    assert!(
+        !text.contains(&"e".repeat(300)),
+        "the bulk of the oversized error must be dropped: {text}"
+    );
+}
+
+#[test]
 fn a_history_within_budget_is_returned_unchanged() {
     let only = observation(0, "fine", "");
     let text = only.to_content();
