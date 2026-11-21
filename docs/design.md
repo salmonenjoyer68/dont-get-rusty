@@ -263,7 +263,7 @@ Every value has a documented default, so a partial file is valid. `--policy <fil
 
 ## Audit
 
-Append-only JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Guest cannot read it. One event per Tool Call:
+Append-only JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Guest cannot read it. The log and its `.quarantine` companion must be regular files: a symlinked path is refused at startup rather than followed, even when the link resolves outside the Workspace, so a link cannot redirect records into it. One event per Tool Call:
 
 ```json
 {"ts":"2026-11-03T12:00:00Z","session":"…","step":3,"tool":"write_file","args_sha256":"…","args_prefix":"…","decision":"allow","error":"workspace quota exceeded: …","exit_code":null,"stdout_bytes":0,"stderr_bytes":0,"truncated":false,"duration_ms":4}
