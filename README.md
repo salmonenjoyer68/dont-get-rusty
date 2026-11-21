@@ -142,6 +142,7 @@ Output byte counts are totals produced before truncation.
 scripts/fetch-assets.sh          # once, needs network
 cargo test --offline             # ~3 minutes; the real CPython Guest runs
 cargo test --offline --features web   # adds the Web Demo routes
+node --test web/app.test.mjs     # Web Demo workspace-browser tests (Node built-ins only)
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
@@ -150,7 +151,9 @@ The suite includes a consolidated escape suite against the real Guest
 (`tests/escape.rs`), an end-to-end CLI test that spawns the binary against a
 dependency-free stub OpenAI server on loopback (`tests/e2e.rs`), and the
 compiled-module cache tests (`tests/cache.rs`). No test contacts Ollama or any
-host beyond `127.0.0.1`.
+host beyond `127.0.0.1`. The Web Demo tests drive the real `web/app.js` through
+a minimal DOM and `fetch` stub, so they need only Node's built-in test runner
+and no npm install.
 
 After the one-time asset fetch (and the initial Cargo dependency download), the
 agent works offline: the only network dependency at runtime is your local model

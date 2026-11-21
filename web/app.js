@@ -15,6 +15,7 @@ let running = false;
 let currentDecision = null;
 let pendingCalls = [];
 let workspacePath = '';
+let workspaceGeneration = 0;
 
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -192,6 +193,7 @@ async function submitTask(task) {
 }
 
 async function refreshWorkspace(path) {
+  const generation = ++workspaceGeneration;
   workspacePath = path;
   $('#path').textContent = `/${path}`;
   const list = $('#files');
@@ -199,11 +201,13 @@ async function refreshWorkspace(path) {
   fileView.hidden = true;
 
   const response = await fetch(`/api/workspace?path=${encodeURIComponent(path)}`);
+  if (generation !== workspaceGeneration) return;
   if (!response.ok) {
     list.append(el('li', 'hint', 'cannot list this directory'));
     return;
   }
   const entries = await response.json();
+  if (generation !== workspaceGeneration) return;
   for (const entry of entries) {
     const child = path ? `${path}/${entry.name}` : entry.name;
     const button = el(
