@@ -144,6 +144,53 @@ fn an_allowed_and_a_denied_call_record_the_expected_fields() {
 }
 
 #[test]
+fn two_logs_opened_in_one_process_get_different_sessions() {
+    let first_cwd = TempDir::new().unwrap();
+    let second_cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+
+    let first =
+        AuditLog::open(first_cwd.path(), workspace.path()).expect("the first log should open");
+    let second =
+        AuditLog::open(second_cwd.path(), workspace.path()).expect("the second log should open");
+    assert_ne!(
+        first.session(),
+        second.session(),
+        "each Audit Log gets its own session id, even when both open in one process"
+    );
+
+    first
+        .record(
+            0,
+            &ToolCall::new("first", "list_files", "{}".to_owned()),
+            &Decision::Allow,
+            &Observation::from_text("list_files", "README.md"),
+            1,
+        )
+        .expect("the first event should be appended");
+    second
+        .record(
+            0,
+            &ToolCall::new("second", "list_files", "{}".to_owned()),
+            &Decision::Allow,
+            &Observation::from_text("list_files", "README.md"),
+            1,
+        )
+        .expect("the second event should be appended");
+
+    let first_events = events(first.path());
+    let second_events = events(second.path());
+    assert_eq!(first_events.len(), 1);
+    assert_eq!(second_events.len(), 1);
+    assert_eq!(first_events[0]["session"], json!(first.session()));
+    assert_eq!(second_events[0]["session"], json!(second.session()));
+    assert_ne!(
+        first_events[0]["session"], second_events[0]["session"],
+        "the events carry the id of the log that wrote them"
+    );
+}
+
+#[test]
 fn code_file_bodies_and_piped_input_never_reach_the_log() {
     let cwd = TempDir::new().unwrap();
     let workspace = TempDir::new().unwrap();

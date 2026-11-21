@@ -69,16 +69,31 @@ fn test_state(
     audit_cwd: &std::path::Path,
     audit_path: &std::path::Path,
 ) -> Arc<AppState> {
+    test_state_with(
+        workspace,
+        audit_cwd,
+        audit_path,
+        vec![
+            reply(
+                Some("Let me look."),
+                vec![ToolCall::new("c1", "list_files", "{}".to_owned())],
+            ),
+            reply(Some("Found one file."), Vec::new()),
+        ],
+    )
+}
+
+/// [`test_state`] with an explicit script for the fake model.
+fn test_state_with(
+    workspace: &std::path::Path,
+    audit_cwd: &std::path::Path,
+    audit_path: &std::path::Path,
+    replies: Vec<ChatResponse>,
+) -> Arc<AppState> {
     let image =
         RuntimeImage::discover().expect("runtime image missing: run `scripts/fetch-assets.sh`");
     let sandbox = Arc::new(Sandbox::new(image.root()).expect("failed to create sandbox"));
-    let chat = FakeChat::new(vec![
-        reply(
-            Some("Let me look."),
-            vec![ToolCall::new("c1", "list_files", "{}".to_owned())],
-        ),
-        reply(Some("Found one file."), Vec::new()),
-    ]);
+    let chat = FakeChat::new(replies);
     let policy = Policy::default();
     let workspace =
         Workspace::open_with_quota(workspace, policy.workspace_quota_bytes()).expect("workspace");
@@ -94,6 +109,30 @@ fn test_state(
         audit_path: audit_path.to_path_buf(),
         model: "test-model".to_owned(),
     })
+}
+
+/// Polls `/api/state` until the current Task reports `task_finished`.
+async fn wait_for_task_finished(client: &reqwest::Client, base: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let snapshot: Value = client
+            .get(format!("{base}/api/state"))
+            .send()
+            .await
+            .expect("state")
+            .json()
+            .await
+            .expect("state json");
+        let events = snapshot["events"].as_array().cloned().unwrap_or_default();
+        if events
+            .iter()
+            .any(|event| event["type"] == json!("task_finished"))
+        {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the Task should finish");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -124,28 +163,7 @@ async fn a_task_streams_events_and_the_page_can_read_workspace_and_audit() {
     assert_eq!(response.status(), 202);
 
     // Wait for the Agent Loop to finish, then inspect the retained transcript.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut finished = None;
-    while tokio::time::Instant::now() < deadline {
-        let snapshot: Value = client
-            .get(format!("{base}/api/state"))
-            .send()
-            .await
-            .expect("state")
-            .json()
-            .await
-            .expect("state json");
-        let events = snapshot["events"].as_array().cloned().unwrap_or_default();
-        let done = events
-            .iter()
-            .any(|event| event["type"] == json!("task_finished"));
-        if done {
-            finished = Some(snapshot);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let snapshot = finished.expect("the Task should finish");
+    let snapshot = wait_for_task_finished(&client, &base).await;
     assert_eq!(snapshot["running"], json!(false));
 
     let events = snapshot["events"].as_array().expect("events");
@@ -246,6 +264,74 @@ async fn a_task_streams_events_and_the_page_can_read_workspace_and_audit() {
     assert!(body.contains("observation"), "SSE body: {body}");
 
     server.abort();
+}
+
+/// Every Web Demo Task opens its own Audit Log, so it must get its own session
+/// id while its Step counter restarts at 0. Sharing a process-wide session made
+/// two consecutive Tasks look like a single session that restarted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consecutive_tasks_get_fresh_audit_sessions_with_steps_starting_at_zero() {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let audit_dir = tempfile::tempdir().expect("audit dir");
+    let audit_path = audit_dir.path().join(".agent").join("audit.jsonl");
+    std::fs::create_dir_all(audit_path.parent().expect("parent")).expect("audit parent");
+
+    let replies = (0..2)
+        .flat_map(|_| {
+            [
+                reply(
+                    Some("Let me look."),
+                    vec![ToolCall::new("c1", "list_files", "{}".to_owned())],
+                ),
+                reply(Some("Found one file."), Vec::new()),
+            ]
+        })
+        .collect();
+    let state = test_state_with(workspace.path(), audit_dir.path(), &audit_path, replies);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(serve_on(listener, Arc::clone(&state)));
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    for task in ["first task", "second task"] {
+        let response = client
+            .post(format!("{base}/api/task"))
+            .json(&json!({ "task": task }))
+            .send()
+            .await
+            .expect("submit");
+        assert_eq!(response.status(), 202);
+        let snapshot = wait_for_task_finished(&client, &base).await;
+        assert_eq!(snapshot["running"], json!(false));
+    }
+    server.abort();
+
+    let text = std::fs::read_to_string(&audit_path).expect("the audit log should be readable");
+    let events: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every line is one JSON event"))
+        .collect();
+    assert_eq!(events.len(), 2, "each Task wrote one Tool Call event");
+    let sessions: Vec<&str> = events
+        .iter()
+        .map(|event| {
+            event["session"]
+                .as_str()
+                .expect("every event carries a session id")
+        })
+        .collect();
+    assert_ne!(
+        sessions[0], sessions[1],
+        "two consecutive Tasks must not share an Audit Log session: {sessions:?}"
+    );
+    for event in &events {
+        assert_eq!(
+            event["step"],
+            json!(0),
+            "each Task's first Tool Call is Step 0"
+        );
+    }
 }
 
 /// Two browser tabs both see an event pushed after they connected.

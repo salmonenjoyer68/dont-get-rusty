@@ -215,7 +215,7 @@ Non-streaming: one `/v1/chat/completions` request per Step, `tools` built from t
 cargo run --features web --bin dont-get-rusty-web -- [--workspace DIR] [--policy FILE] [--port 7878]
 ```
 
-Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log session) over the shared `Sandbox` and `Chat`. A second submission while one runs gets `409`. There is no cancel button: a Task ends at its answer, its Step limit, or a dropped connection only when it reaches one.
+Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log with its own session id) over the shared `Sandbox` and `Chat`. A second submission while one runs gets `409`. There is no cancel button: a Task ends at its answer, its Step limit, or a dropped connection only when it reaches one.
 
 | Route | Meaning |
 |---|---|
@@ -270,6 +270,8 @@ Append-only JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Gues
 ```
 
 Args are truncated to 2 KiB plus a SHA-256 of the full payload; code, file contents, and piped `stdin` are never stored.
+
+The `session` id identifies one Audit Log handle: it is generated when the log is opened, and every event written through that handle carries it. The CLI opens one log per process, so a CLI run stays one session; the Web Demo opens one log per Task, so each Task records a new session id while its `step` counter restarts at 0.
 
 A failed append can leave an unterminated final record. Opening the log validates that tail first: a complete event missing only its newline is terminated, and an incomplete fragment is moved to `audit.jsonl.quarantine` before the next event is written. Bytes belonging to complete records are never rewritten.
 

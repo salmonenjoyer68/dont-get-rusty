@@ -245,8 +245,8 @@ async fn submit(State(state): State<Arc<AppState>>, Json(request): Json<TaskRequ
 }
 
 /// One Task: a fresh Agent (so per-Task write tracking starts empty), a fresh
-/// Workspace handle, and a fresh Audit Log session — all against the same
-/// Policy and Sandbox the CLI uses.
+/// Workspace handle, and a fresh Audit Log with its own session id — all
+/// against the same Policy and Sandbox the CLI uses.
 async fn run_task(state: &AppState, task: &str) -> Result<AgentResult, String> {
     let workspace =
         Workspace::open_with_quota(&state.workspace_root, state.policy.workspace_quota_bytes())
