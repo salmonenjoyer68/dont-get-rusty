@@ -457,6 +457,11 @@ dialog pre {
   margin-bottom: 14px;
 }
 
+.decision-error {
+  margin: 0 0 12px;
+  color: var(--error);
+}
+
 dialog .row {
   display: flex;
   justify-content: flex-end;

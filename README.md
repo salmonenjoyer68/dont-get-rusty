@@ -61,7 +61,7 @@ pipeline never hangs.
 The same Agent Loop behind a localhost browser page:
 
 ```sh
-cargo run --features web --bin dont-get-rusty-web
+cargo run --features web --bin dont-get-rusty-web -- [--workspace DIR] [--policy FILE] [--port 7878]
 ```
 
 It serves `http://127.0.0.1:7878` (loopback only, no authentication, no CORS)
@@ -129,6 +129,12 @@ full arguments, the redacted argument prefix, the decision, exit code, output
 byte counts, truncation flag, and duration. `code`, `content`, and `stdin` are
 replaced by `<omitted: N bytes>` markers, so bodies never reach the log.
 
+An append that fails halfway can leave an unterminated final record. Opening
+the log validates that tail: a complete event missing only its newline is
+terminated, and an incomplete fragment is moved to
+`<cwd>/.agent/audit.jsonl.quarantine` before the next event is written, so one
+event never merges into another. Complete records are never rewritten.
+
 `decision`/`denial_reason` are the Policy verdict only. A call the Policy
 allowed but that failed on the host (quota, escape, overwrite decline,
 malformed arguments, Sandbox setup) stays `allow` and records the host-side
@@ -140,17 +146,25 @@ Output byte counts are totals produced before truncation.
 
 ```sh
 scripts/fetch-assets.sh          # once, needs network
+bash tests/fetch_assets_test.sh  # offline; fetch script manifest verification
 cargo test --offline             # ~3 minutes; the real CPython Guest runs
 cargo test --offline --features web   # adds the Web Demo routes
+node --test web/app.test.mjs     # Web Demo workspace-browser tests (Node built-ins only)
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+`tests/fetch_assets_test.sh` drives the fetch script's `checksums.txt`
+verification and refetch decision against temporary fake images with a stub
+`curl`, so it needs neither network nor a fetched `assets/` directory.
 
 The suite includes a consolidated escape suite against the real Guest
 (`tests/escape.rs`), an end-to-end CLI test that spawns the binary against a
 dependency-free stub OpenAI server on loopback (`tests/e2e.rs`), and the
 compiled-module cache tests (`tests/cache.rs`). No test contacts Ollama or any
-host beyond `127.0.0.1`.
+host beyond `127.0.0.1`. The Web Demo tests drive the real `web/app.js` through
+a minimal DOM and `fetch` stub, so they need only Node's built-in test runner
+and no npm install.
 
 After the one-time asset fetch (and the initial Cargo dependency download), the
 agent works offline: the only network dependency at runtime is your local model

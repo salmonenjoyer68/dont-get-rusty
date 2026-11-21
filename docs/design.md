@@ -212,7 +212,7 @@ Non-streaming: one `/v1/chat/completions` request per Step, `tools` built from t
 `dont-get-rusty-web` (cargo feature `web`) serves the same Agent Loop to a localhost page. Scope is fixed by `docs/adr/0003-web-demo-scope.md`: loopback only, no auth, no CORS, one Task at a time.
 
 ```sh
-cargo run --features web --bin dont-get-rusty-web [--workspace DIR] [--policy FILE] [--port 7878]
+cargo run --features web --bin dont-get-rusty-web -- [--workspace DIR] [--policy FILE] [--port 7878]
 ```
 
 Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log session) over the shared `Sandbox` and `Chat`. A second submission while one runs gets `409`. There is no cancel button: a Task ends at its answer, its Step limit, or a dropped connection only when it reaches one.
@@ -228,7 +228,7 @@ Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log sessio
 | `GET /api/workspace/file?path=` | Read-only file view, capped at 64 KiB |
 | `GET /api/audit` | Last 200 Audit Events |
 
-The SSE stream is driven by a `Notify`-woken replay loop, not a broadcast channel: events are retained per Task, so a reconnect or a page loaded mid-Task replays from index 0 and cannot lose or reorder events. The cursor resets when a new Task clears the transcript.
+The SSE stream is driven by a `watch` generation counter, not a single-waiter `Notify`: each stream subscribes before reading the transcript, so a change landing between the read and the wait still wakes it, and every open tab wakes instead of racing for one wakeup. Events are retained per Task, so a reconnect or a page loaded mid-Task replays from index 0 and cannot lose or reorder events. The cursor resets when a new Task clears the transcript.
 
 Confirmations reuse the core's synchronous prompts: the Web Demo blocks the Agent's worker thread (`tokio::task::block_in_place`) on a channel until the page answers, with a 10-minute timeout answered `deny`. Every Step, Tool Call, and Observation is sent to the browser with its arguments and captured output; the Audit Log stays redacted.
 
@@ -270,6 +270,8 @@ Append-only JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Gues
 ```
 
 Args are truncated to 2 KiB plus a SHA-256 of the full payload; code, file contents, and piped `stdin` are never stored.
+
+A failed append can leave an unterminated final record. Opening the log validates that tail first: a complete event missing only its newline is terminated, and an incomplete fragment is moved to `audit.jsonl.quarantine` before the next event is written. Bytes belonging to complete records are never rewritten.
 
 `decision`/`denial_reason` are the Policy verdict only: `deny` with a reason for a Policy refusal, `allow` otherwise. A call the Policy allowed but that failed on the host (quota, escape, overwrite decline, malformed arguments, Sandbox setup) stays `allow` and records the host-side message in the optional `error` field; a Policy denial has `denial_reason` and no `error`. A Guest Run records `allow` even when its exit code is non-zero: the Guest ran, and the exit code is the result. Output byte counts are totals produced before truncation.
 

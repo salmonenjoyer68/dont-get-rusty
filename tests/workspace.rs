@@ -32,6 +32,13 @@ fn expect_denied<T: std::fmt::Debug>(result: Result<T, FsError>) {
     }
 }
 
+/// Builds a workspace-relative file path nested `parents` directories deep.
+fn nested_path(parents: usize, file: &str) -> String {
+    let mut path = "d/".repeat(parents);
+    path.push_str(file);
+    path
+}
+
 #[test]
 fn default_quota_is_fifty_megabytes() {
     let dir = TempDir::new().unwrap();
@@ -161,6 +168,55 @@ fn quota_is_checked_before_any_directory_or_file_is_created() {
 }
 
 #[test]
+fn deep_write_is_rejected_and_leaves_the_workspace_writable() {
+    let dir = TempDir::new().unwrap();
+    let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+
+    // 66 parent directories would put the tree two levels past the depth the
+    // size scan can walk. Creating it used to poison every later write.
+    match ws.write_file(nested_path(66, "deep.txt"), b"poison") {
+        Err(FsError::TooDeep) => {}
+        other => panic!("expected TooDeep, got {other:?}"),
+    }
+
+    // The refused write created nothing, so the tree still scans...
+    assert!(!dir.path().join("d").exists());
+    assert_eq!(ws.total_size().unwrap(), 0);
+
+    // ...and a shallow write afterward still succeeds.
+    ws.write_file("notes/later.txt", b"ok").unwrap();
+    assert_eq!(ws.read_file("notes/later.txt").unwrap(), b"ok");
+}
+
+#[test]
+fn writes_at_the_scanner_depth_limit_are_allowed_and_one_parent_deeper_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+
+    // The size scan walks directories up to 64 levels below the root, so a
+    // file with 64 parent directories creates a tree the scan still measures.
+    let at_limit = nested_path(64, "at-limit.txt");
+    ws.write_file(&at_limit, b"ok").unwrap();
+    assert_eq!(ws.read_file(&at_limit).unwrap(), b"ok");
+    assert_eq!(ws.total_size().unwrap(), 2);
+
+    // One more parent directory would take the scan past its limit. The write
+    // is refused before creating anything, with a unique root so absence is
+    // observable.
+    let one_too_deep = format!("overflow/{}", nested_path(64, "too-deep.txt"));
+    match ws.write_file(&one_too_deep, b"poison") {
+        Err(FsError::TooDeep) => {}
+        other => panic!("expected TooDeep, got {other:?}"),
+    }
+    assert!(!dir.path().join("overflow").exists());
+    assert_eq!(ws.total_size().unwrap(), 2);
+
+    // The workspace is unchanged and remains writable.
+    ws.write_file("shallow.txt", b"ok").unwrap();
+    assert_eq!(ws.total_size().unwrap(), 4);
+}
+
+#[test]
 fn denied_overwrite_leaves_the_old_file_intact() {
     let dir = TempDir::new().unwrap();
     let ws = open(dir.path(), 10);
@@ -205,6 +261,19 @@ fn non_file_targets_are_rejected_without_touching_them() {
     }
     assert!(dir.path().join("sub").is_dir());
     assert!(!dir.path().join("sub/x").exists());
+}
+
+#[test]
+fn read_file_rejects_a_directory_as_not_a_file() {
+    let dir = TempDir::new().unwrap();
+    let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+    fs::create_dir(dir.path().join("sub")).unwrap();
+
+    match ws.read_file("sub") {
+        Err(FsError::NotAFile) => {}
+        other => panic!("expected NotAFile, got {other:?}"),
+    }
+    assert!(dir.path().join("sub").is_dir());
 }
 
 #[test]
@@ -302,6 +371,58 @@ mod symlinks {
 }
 
 #[cfg(unix)]
+mod non_regular_files {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Creates a FIFO with the platform `mkfifo` command.
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("`mkfifo` should be available on this platform");
+        assert!(status.success(), "mkfifo failed with {status}");
+    }
+
+    #[test]
+    fn fifo_is_rejected_as_not_a_file_without_blocking() {
+        let dir = TempDir::new().unwrap();
+        let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+        make_fifo(&dir.path().join("pipe"));
+
+        // Reading a FIFO used to open it, which blocks until a writer appears.
+        // Run the read on a worker so a regression fails here with a message
+        // instead of hanging the whole suite.
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = ws.read_file("pipe");
+            let _ = sender.send(result.map(|bytes| bytes.len()));
+        });
+
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(Err(FsError::NotAFile)) => {}
+            Ok(other) => panic!("expected NotAFile, got {other:?}"),
+            Err(_) => panic!("read_file on a FIFO blocked instead of returning NotAFile"),
+        }
+    }
+
+    #[test]
+    fn symlink_to_a_directory_is_rejected_as_not_a_file() {
+        let dir = TempDir::new().unwrap();
+        let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+        fs::create_dir(dir.path().join("real_dir")).unwrap();
+        symlink("real_dir", dir.path().join("dir_link")).unwrap();
+
+        match ws.read_file("dir_link") {
+            Err(FsError::NotAFile) => {}
+            other => panic!("expected NotAFile, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn assert_temp_root_has_only_workspace(root: &Path) {
     let mut names: Vec<_> = fs::read_dir(root)
         .unwrap()
@@ -373,6 +494,7 @@ proptest! {
         temp.close().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn hostile_paths_with_random_symlinks_never_escape(path in hostile_path(), link in "[A-Za-z0-9_.-]{1,8}") {
         let temp = TempDir::new().unwrap();

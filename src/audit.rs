@@ -27,9 +27,15 @@
 //! Each event is one synchronous append followed by a flush, so a crash keeps
 //! every completed event and at worst loses the one in flight. A write failure
 //! is an error, never a silently dropped event.
+//!
+//! A write that fails halfway leaves part of a line at the end of the file.
+//! Opening the log repairs that tail before anything is appended: a fragment
+//! that is a complete serialized event is terminated, and an incomplete one is
+//! moved to `<audit.jsonl>.quarantine`, so the next event always starts on its
+//! own line. Bytes belonging to complete records are never rewritten.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -135,6 +141,7 @@ impl AuditEvent {
 #[derive(Debug)]
 pub struct AuditLog {
     path: PathBuf,
+    quarantine: PathBuf,
     session: String,
     file: Mutex<File>,
 }
@@ -196,10 +203,13 @@ impl AuditLog {
     /// Opens the log at `path`, appending to any existing file.
     ///
     /// The parent directory must exist; [`AuditLog::open`] creates `.agent/`
-    /// and enforces the outside-the-Workspace rule.
+    /// and enforces the outside-the-Workspace rule. An unterminated final
+    /// record left by a failed append is repaired before the log is returned,
+    /// so the next event cannot merge into the fragment.
     pub fn at(path: impl Into<PathBuf>) -> Result<Self, AuditError> {
         let path = path.into();
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
+            .read(true)
             .create(true)
             .append(true)
             .open(&path)
@@ -207,7 +217,9 @@ impl AuditLog {
                 path: path.clone(),
                 source,
             })?;
+        repair_unterminated_tail(&path, &mut file)?;
         Ok(Self {
+            quarantine: quarantine_path(&path),
             path,
             session: SESSION.clone(),
             file: Mutex::new(file),
@@ -217,6 +229,12 @@ impl AuditLog {
     /// The file events are appended to.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The file where an incomplete final record is preserved when the log is
+    /// opened. Complete records stay in the log.
+    pub fn quarantine_path(&self) -> &Path {
+        &self.quarantine
     }
 
     /// The id shared by every event of this process.
@@ -267,6 +285,109 @@ impl AuditLog {
 /// A process handles one session, so the id is generated once and reused for
 /// every event.
 static SESSION: LazyLock<String> = LazyLock::new(|| format!("{:016x}", rand::random::<u64>()));
+
+/// The path where a fragment moved out of `path` is preserved.
+fn quarantine_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".quarantine");
+    PathBuf::from(name)
+}
+
+/// Makes sure a log whose last append failed halfway cannot merge the next
+/// event into the fragment.
+///
+/// A final record that is complete JSON but missing only its newline is
+/// terminated and kept. An incomplete fragment is appended to the quarantine
+/// file and then cut from the log; complete records are left byte for byte.
+fn repair_unterminated_tail(path: &Path, file: &mut File) -> Result<(), AuditError> {
+    let Some((start, fragment)) = unterminated_tail(file).map_err(|source| AuditError::Repair {
+        path: path.to_path_buf(),
+        source,
+    })?
+    else {
+        return Ok(());
+    };
+
+    // A prefix of a serialized event that parses as a JSON object can only be
+    // the whole event missing its newline: any earlier cut would leave an
+    // unclosed string, array, or object.
+    let complete =
+        serde_json::from_slice::<serde_json::Value>(&fragment).is_ok_and(|value| value.is_object());
+    if complete {
+        return file
+            .write_all(b"\n")
+            .and_then(|()| file.flush())
+            .map_err(|source| AuditError::Repair {
+                path: path.to_path_buf(),
+                source,
+            });
+    }
+
+    let quarantine = quarantine_path(path);
+    let mut quarantined = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&quarantine)
+        .map_err(|source| AuditError::Repair {
+            path: quarantine.clone(),
+            source,
+        })?;
+    quarantined
+        .write_all(&fragment)
+        .and_then(|()| quarantined.write_all(b"\n"))
+        .and_then(|()| quarantined.flush())
+        .map_err(|source| AuditError::Repair {
+            path: quarantine.clone(),
+            source,
+        })?;
+    // Truncate only after the fragment is safely preserved.
+    file.set_len(start)
+        .and_then(|()| file.flush())
+        .map_err(|source| AuditError::Repair {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// The byte offset and bytes of a final record that lacks its newline.
+///
+/// Returns `None` when the file is empty or already ends with `\n`. The read
+/// starts at the last byte and walks backwards only until the previous newline,
+/// so a healthy log is not scanned.
+fn unterminated_tail(file: &mut File) -> io::Result<Option<(u64, Vec<u8>)>> {
+    const CHUNK: u64 = 8 * 1024;
+
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(None);
+    }
+
+    let mut tail = Vec::new();
+    let mut end = len;
+    loop {
+        let start = end.saturating_sub(CHUNK);
+        let mut chunk = vec![0u8; (end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk)?;
+        if let Some(newline) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            let mut fragment = chunk[newline + 1..].to_vec();
+            fragment.extend_from_slice(&tail);
+            return Ok(Some((start + newline as u64 + 1, fragment)));
+        }
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        if start == 0 {
+            return Ok(Some((0, tail)));
+        }
+        end = start;
+    }
+}
 
 /// The current time as RFC 3339 in UTC, e.g. `2026-11-03T12:00:00.123Z`.
 fn utc_now() -> String {
@@ -362,6 +483,12 @@ pub enum AuditError {
     },
     #[error("failed to append to audit log `{path}`")]
     Write {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to repair an unterminated audit record in `{path}`")]
+    Repair {
         path: PathBuf,
         #[source]
         source: io::Error,

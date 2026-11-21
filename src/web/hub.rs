@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::agent::Observer;
 use crate::llm::ToolCall;
@@ -115,7 +115,30 @@ struct Inner {
 /// The Web Demo's shared state for events and Confirmations.
 pub struct Hub {
     inner: Mutex<Inner>,
-    changed: Notify,
+    /// Bumped whenever the transcript changes.
+    ///
+    /// A `watch` generation rather than a `Notify`: every subscriber observes
+    /// the new value, so both browser tabs wake, and a subscriber that takes
+    /// its receiver before reading the transcript cannot miss a change that
+    /// lands between the read and the wait.
+    changed: watch::Sender<u64>,
+}
+
+/// A subscription to the Hub's change signal.
+///
+/// Take one before calling [`Hub::events_since`]: a change after that point
+/// wakes every subscription, so two pages cannot race for one wakeup.
+pub struct Change {
+    generation: watch::Receiver<u64>,
+}
+
+impl Change {
+    /// Resolves once the transcript may have changed since this subscription
+    /// was created or since the last call returned.
+    pub async fn changed(&mut self) {
+        // The Hub owns the sender, so this only fails once the Hub is gone.
+        let _ = self.generation.changed().await;
+    }
 }
 
 impl Default for Hub {
@@ -126,6 +149,7 @@ impl Default for Hub {
 
 impl Hub {
     pub fn new() -> Self {
+        let (changed, _) = watch::channel(0);
         Self {
             inner: Mutex::new(Inner {
                 running: false,
@@ -134,7 +158,7 @@ impl Hub {
                 pending: None,
                 next_decision: 0,
             }),
-            changed: Notify::new(),
+            changed,
         }
     }
 
@@ -144,12 +168,18 @@ impl Hub {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Wakes every subscriber by advancing the change generation.
+    fn notify(&self) {
+        self.changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     fn push(&self, event: Event) {
         {
             let mut inner = self.lock();
             inner.events.push(event);
         }
-        self.changed.notify_one();
+        self.notify();
     }
 
     /// Claims the single Task slot, clearing the previous transcript.
@@ -170,7 +200,7 @@ impl Hub {
             task: task.to_owned(),
         });
         drop(inner);
-        self.changed.notify_one();
+        self.notify();
         Some(TaskGuard {
             hub: Arc::clone(self),
             started: Instant::now(),
@@ -190,7 +220,7 @@ impl Hub {
             duration_ms: duration.as_millis() as u64,
         });
         drop(inner);
-        self.changed.notify_one();
+        self.notify();
     }
 
     /// Asks the browser a Confirmation and blocks until it answers or the
@@ -217,7 +247,7 @@ impl Hub {
             });
             id
         };
-        self.changed.notify_one();
+        self.notify();
 
         let received = tokio::task::block_in_place(|| answer.recv_timeout(DECISION_TIMEOUT));
         let (allow, timed_out) = match received {
@@ -241,7 +271,7 @@ impl Hub {
             });
         }
         drop(inner);
-        self.changed.notify_one();
+        self.notify();
         allow
     }
 
@@ -266,7 +296,7 @@ impl Hub {
             timed_out: false,
         });
         drop(inner);
-        self.changed.notify_one();
+        self.notify();
         true
     }
 
@@ -301,9 +331,15 @@ impl Hub {
         (inner.running, inner.events.clone())
     }
 
-    /// Resolves when any event is pushed.
-    pub async fn changed(&self) {
-        self.changed.notified().await;
+    /// Subscribes to wakeups about transcript changes.
+    ///
+    /// Take the subscription before reading [`Hub::events_since`], then wait on
+    /// [`Change::changed`] when that read came back empty; a change landing in
+    /// between still wakes this subscription.
+    pub fn subscribe(&self) -> Change {
+        Change {
+            generation: self.changed.subscribe(),
+        }
     }
 }
 
