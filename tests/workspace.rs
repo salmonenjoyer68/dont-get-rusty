@@ -32,6 +32,13 @@ fn expect_denied<T: std::fmt::Debug>(result: Result<T, FsError>) {
     }
 }
 
+/// Builds a workspace-relative file path nested `parents` directories deep.
+fn nested_path(parents: usize, file: &str) -> String {
+    let mut path = "d/".repeat(parents);
+    path.push_str(file);
+    path
+}
+
 #[test]
 fn default_quota_is_fifty_megabytes() {
     let dir = TempDir::new().unwrap();
@@ -158,6 +165,55 @@ fn quota_is_checked_before_any_directory_or_file_is_created() {
     assert!(!dir.path().join("nested").exists());
     assert!(!dir.path().join("b.txt").exists());
     assert_eq!(ws.total_size().unwrap(), 6);
+}
+
+#[test]
+fn deep_write_is_rejected_and_leaves_the_workspace_writable() {
+    let dir = TempDir::new().unwrap();
+    let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+
+    // 66 parent directories would put the tree two levels past the depth the
+    // size scan can walk. Creating it used to poison every later write.
+    match ws.write_file(nested_path(66, "deep.txt"), b"poison") {
+        Err(FsError::TooDeep) => {}
+        other => panic!("expected TooDeep, got {other:?}"),
+    }
+
+    // The refused write created nothing, so the tree still scans...
+    assert!(!dir.path().join("d").exists());
+    assert_eq!(ws.total_size().unwrap(), 0);
+
+    // ...and a shallow write afterward still succeeds.
+    ws.write_file("notes/later.txt", b"ok").unwrap();
+    assert_eq!(ws.read_file("notes/later.txt").unwrap(), b"ok");
+}
+
+#[test]
+fn writes_at_the_scanner_depth_limit_are_allowed_and_one_parent_deeper_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+
+    // The size scan walks directories up to 64 levels below the root, so a
+    // file with 64 parent directories creates a tree the scan still measures.
+    let at_limit = nested_path(64, "at-limit.txt");
+    ws.write_file(&at_limit, b"ok").unwrap();
+    assert_eq!(ws.read_file(&at_limit).unwrap(), b"ok");
+    assert_eq!(ws.total_size().unwrap(), 2);
+
+    // One more parent directory would take the scan past its limit. The write
+    // is refused before creating anything, with a unique root so absence is
+    // observable.
+    let one_too_deep = format!("overflow/{}", nested_path(64, "too-deep.txt"));
+    match ws.write_file(&one_too_deep, b"poison") {
+        Err(FsError::TooDeep) => {}
+        other => panic!("expected TooDeep, got {other:?}"),
+    }
+    assert!(!dir.path().join("overflow").exists());
+    assert_eq!(ws.total_size().unwrap(), 2);
+
+    // The workspace is unchanged and remains writable.
+    ws.write_file("shallow.txt", b"ok").unwrap();
+    assert_eq!(ws.total_size().unwrap(), 4);
 }
 
 #[test]
