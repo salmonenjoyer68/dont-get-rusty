@@ -264,6 +264,19 @@ fn non_file_targets_are_rejected_without_touching_them() {
 }
 
 #[test]
+fn read_file_rejects_a_directory_as_not_a_file() {
+    let dir = TempDir::new().unwrap();
+    let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+    fs::create_dir(dir.path().join("sub")).unwrap();
+
+    match ws.read_file("sub") {
+        Err(FsError::NotAFile) => {}
+        other => panic!("expected NotAFile, got {other:?}"),
+    }
+    assert!(dir.path().join("sub").is_dir());
+}
+
+#[test]
 fn resolve_rel_drops_curdir_and_returns_a_relative_path() {
     assert_eq!(resolve_rel(Path::new("./a/./b")).unwrap(), Path::new("a/b"));
     assert_eq!(resolve_rel(Path::new(".")).unwrap(), Path::new(""));
@@ -354,6 +367,58 @@ mod symlinks {
         );
         // Symlinks do not add to the total.
         assert_eq!(ws.total_size().unwrap(), 5);
+    }
+}
+
+#[cfg(unix)]
+mod non_regular_files {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Creates a FIFO with the platform `mkfifo` command.
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("`mkfifo` should be available on this platform");
+        assert!(status.success(), "mkfifo failed with {status}");
+    }
+
+    #[test]
+    fn fifo_is_rejected_as_not_a_file_without_blocking() {
+        let dir = TempDir::new().unwrap();
+        let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+        make_fifo(&dir.path().join("pipe"));
+
+        // Reading a FIFO used to open it, which blocks until a writer appears.
+        // Run the read on a worker so a regression fails here with a message
+        // instead of hanging the whole suite.
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = ws.read_file("pipe");
+            let _ = sender.send(result.map(|bytes| bytes.len()));
+        });
+
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(Err(FsError::NotAFile)) => {}
+            Ok(other) => panic!("expected NotAFile, got {other:?}"),
+            Err(_) => panic!("read_file on a FIFO blocked instead of returning NotAFile"),
+        }
+    }
+
+    #[test]
+    fn symlink_to_a_directory_is_rejected_as_not_a_file() {
+        let dir = TempDir::new().unwrap();
+        let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+        fs::create_dir(dir.path().join("real_dir")).unwrap();
+        symlink("real_dir", dir.path().join("dir_link")).unwrap();
+
+        match ws.read_file("dir_link") {
+            Err(FsError::NotAFile) => {}
+            other => panic!("expected NotAFile, got {other:?}"),
+        }
     }
 }
 
