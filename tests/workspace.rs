@@ -519,3 +519,51 @@ proptest! {
         temp.close().unwrap();
     }
 }
+
+#[cfg(unix)]
+mod symlinked_parents {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn a_symlinked_parent_cannot_hide_depth_past_the_limit() {
+        let dir = TempDir::new().unwrap();
+        let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+
+        // A host actor can place an in-workspace link to a deep directory. The
+        // lexical path below names only three parents, but creating it under
+        // the link would put `y` at real depth 65, past what the size scan
+        // walks, and poison every later write.
+        let deep = "d/".repeat(63);
+        let deep = deep.trim_end_matches('/');
+        fs::create_dir_all(dir.path().join(deep)).expect("the deep directory should be created");
+        symlink(deep, dir.path().join("link")).expect("the link should be created");
+
+        match ws.write_file("link/x/y/deep.txt", b"poison") {
+            Err(FsError::TooDeep) => {}
+            other => panic!("expected TooDeep, got {other:?}"),
+        }
+
+        // The refused write created nothing under the link...
+        assert!(!dir.path().join("link/x").exists());
+        assert_eq!(ws.total_size().unwrap(), 0);
+
+        // ...so the tree still scans and a shallow write succeeds.
+        ws.write_file("shallow.txt", b"ok").unwrap();
+        assert_eq!(ws.read_file("shallow.txt").unwrap(), b"ok");
+    }
+
+    #[test]
+    fn writes_through_a_shallow_in_workspace_symlinked_parent_still_work() {
+        let dir = TempDir::new().unwrap();
+        let ws = open(dir.path(), DEFAULT_QUOTA_BYTES);
+        fs::create_dir(dir.path().join("real")).expect("the real directory should be created");
+        symlink("real", dir.path().join("alias")).expect("the link should be created");
+
+        ws.write_file("alias/notes.txt", b"hello")
+            .expect("a shallow in-workspace symlinked parent must stay writable");
+
+        assert_eq!(ws.read_file("real/notes.txt").unwrap(), b"hello");
+        assert_eq!(ws.total_size().unwrap(), 5);
+    }
+}

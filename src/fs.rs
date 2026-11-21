@@ -13,11 +13,13 @@
 //! so a denied write leaves the Workspace exactly as it was. A write whose
 //! parent path would nest deeper than the size scan can walk is refused before
 //! anything is created, so a write cannot leave a tree the scan cannot measure.
-//! The total is a snapshot: an external host process could change the tree
-//! between the scan and the write. That is acceptable for a single-user local
-//! CLI; it is not a defense against a concurrently hostile host process. The
-//! Guest's preopen is read-only (see [`crate::sandbox`]), so the Guest cannot
-//! race the scan either.
+//! Depth is projected through in-workspace symlinked ancestors, so a link
+//! cannot hide a deeper tree behind one lexical component. The total and the
+//! depth projection are snapshots: an external host process could change the
+//! tree between either check and the write. That is acceptable for a
+//! single-user local CLI; it is not a defense against a concurrently hostile
+//! host process. The Guest's preopen is read-only (see [`crate::sandbox`]), so
+//! the Guest cannot race either check.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -251,11 +253,15 @@ impl Workspace {
     ///
     /// Every traversal, target-type, and quota check runs first. A write that
     /// would create a tree deeper than the size scan can walk is refused with
-    /// [`FsError::TooDeep`], so it cannot make later operations fail. Only then
-    /// is `confirm` called with the Workspace-relative target; returning
-    /// `false` leaves the Workspace exactly as it was and yields
-    /// [`FsError::OverwriteDeclined`]. `confirm` is never called for a target
-    /// that did not exist, because creating a file destroys nothing.
+    /// [`FsError::TooDeep`], so it cannot make later operations fail. Depth
+    /// counts in-workspace symlinked ancestors at their resolved depth, not
+    /// their lexical component count. The depth projection shares the quota
+    /// check's snapshot caveat: a concurrently hostile host process can change
+    /// the tree between the check and `create_dir_all`. Only then is `confirm`
+    /// called with the Workspace-relative target; returning `false` leaves the
+    /// Workspace exactly as it was and yields [`FsError::OverwriteDeclined`].
+    /// `confirm` is never called for a target that did not exist, because
+    /// creating a file destroys nothing.
     pub fn write_file_with_confirm(
         &self,
         path: impl AsRef<Path>,
@@ -263,12 +269,26 @@ impl Workspace {
         confirm: impl FnOnce(&Path) -> bool,
     ) -> Result<WriteInfo, FsError> {
         let rel = resolve_target(path.as_ref())?;
+        let parent = rel.parent().filter(|parent| !parent.as_os_str().is_empty());
 
         // Creating the parent path would add one directory per parent
         // component. Refuse to create a tree the size scan cannot walk before
         // any directory is made: such a tree would fail every later write.
-        let parent_depth = rel.parent().map_or(0, |parent| parent.components().count());
-        if parent_depth > MAX_DEPTH as usize {
+        let lexical_depth = parent.map_or(0, |parent| parent.components().count());
+        if lexical_depth > MAX_DEPTH as usize {
+            return Err(FsError::TooDeep);
+        }
+        // A lexical count understates the real depth when an in-workspace
+        // symlinked ancestor points at a deeper directory: `link/x/y` is three
+        // components, but `link` may resolve to a 63-deep directory. Resolve
+        // the existing ancestor inside the Workspace and add the components
+        // `create_dir_all` would create, so the link cannot hide a tree the
+        // scan cannot walk.
+        let parent_depth = match parent {
+            Some(parent) => self.projected_parent_depth(parent)?,
+            None => 0,
+        };
+        if parent_depth > MAX_DEPTH {
             return Err(FsError::TooDeep);
         }
 
@@ -297,9 +317,7 @@ impl Workspace {
         }
 
         // Only now is anything on disk created or truncated.
-        if let Some(parent) = rel.parent()
-            && !parent.as_os_str().is_empty()
-        {
+        if let Some(parent) = parent {
             self.root.create_dir_all(parent)?;
         }
         let mut file = self.root.open_with(
@@ -352,6 +370,37 @@ impl Workspace {
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
+    }
+
+    /// The real depth `create_dir_all(parent)` would produce.
+    ///
+    /// The deepest existing ancestor is resolved through the Workspace
+    /// capability, which re-roots every symlink expansion at the Workspace, and
+    /// the remaining components are added: a link cannot turn one lexical
+    /// component into a deeper tree. The result is a snapshot of the current
+    /// tree, exactly like [`Workspace::total_size`]; a concurrently hostile
+    /// host process could swap an ancestor between this check and
+    /// `create_dir_all`.
+    fn projected_parent_depth(&self, parent: &Path) -> Result<u32, FsError> {
+        let mut existing = parent;
+        let mut missing = 0u32;
+        loop {
+            if existing.as_os_str().is_empty() {
+                return Ok(missing);
+            }
+            match self.root.metadata(existing) {
+                Ok(_) => {
+                    let canonical = self.root.canonicalize(existing)?;
+                    let current = u32::try_from(canonical.components().count()).unwrap_or(u32::MAX);
+                    return Ok(current.saturating_add(missing));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    existing = existing.parent().unwrap_or_else(|| Path::new(""));
+                    missing = missing.saturating_add(1);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// Total size of the Workspace's regular files in bytes.
