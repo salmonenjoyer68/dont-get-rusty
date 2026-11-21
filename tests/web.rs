@@ -441,10 +441,9 @@ async fn dns_rebinding_requests_are_rejected_while_same_origin_requests_work() {
     let base = format!("http://{addr}");
     let loopback_with_port = format!("localhost:{}", addr.port());
 
-    fn rejected(status: reqwest::StatusCode) -> bool {
-        status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::FORBIDDEN
-    }
-
+    // A missing or foreign Host is a malformed request (400); a foreign Origin
+    // on a state-changing request is a refused authority (403). The tests below
+    // pin the exact status so the two cannot drift back into "either".
     // A foreign Host reads like the attacker's page, not the Web Demo.
     for host in [
         "attacker.example",
@@ -460,10 +459,10 @@ async fn dns_rebinding_requests_are_rejected_while_same_origin_requests_work() {
             .send()
             .await
             .expect("foreign host");
-        assert!(
-            rejected(response.status()),
-            "Host `{host}` should be rejected, got {}",
-            response.status()
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "Host `{host}` should be rejected as a bad request"
         );
     }
 
@@ -534,10 +533,10 @@ async fn dns_rebinding_requests_are_rejected_while_same_origin_requests_work() {
             .send()
             .await
             .expect("foreign origin");
-        assert!(
-            rejected(response.status()),
-            "Origin `{origin}` should be rejected, got {}",
-            response.status()
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "Origin `{origin}` should be refused"
         );
     }
     let (_, events) = state.hub.snapshot();

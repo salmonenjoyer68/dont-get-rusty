@@ -66,11 +66,12 @@ verify_checksums() {
         hash="${line%%  *}"
         path="${line#*  }"
         [[ -n "$hash" && -n "$path" ]] || return 1
-        # Startup rejects absolute paths and `..` components; do not accept a
-        # manifest it would refuse.
+        # Startup accepts only Normal path components: no absolute paths, no
+        # `..`, and no `.` (not even a leading `./`). Do not accept a manifest
+        # it would refuse.
         [[ "$path" != /* ]] || return 1
         case "/$path/" in
-            *"/../"*) return 1 ;;
+            *"/./"* | *"/../"*) return 1 ;;
         esac
         [[ -f "$root/$path" ]] || return 1
         actual="$(sha256 "$root/$path")" || return 1

@@ -15,7 +15,7 @@ use dont_get_rusty::agent::{
 };
 use dont_get_rusty::assets::RuntimeImage;
 use dont_get_rusty::audit::AuditLog;
-use dont_get_rusty::context::{HistoryEntry, compact};
+use dont_get_rusty::context::{HistoryEntry, MAX_STUB_CHARS, compact};
 use dont_get_rusty::fs::Workspace;
 use dont_get_rusty::llm::{
     Chat, ChatResponse, Choice, LlmError, Message, ResponseMessage, ToolCall,
@@ -384,8 +384,8 @@ fn a_huge_first_stderr_line_is_capped_in_the_stub() {
     let text = tool_content(&messages, "huge");
 
     assert!(
-        text.chars().count() <= 700,
-        "a 64 KiB stderr line must not inflate the stub: {} characters",
+        text.chars().count() <= MAX_STUB_CHARS,
+        "a 64 KiB stderr line must not inflate the stub (bound {MAX_STUB_CHARS}): {} characters",
         text.chars().count()
     );
     assert!(
@@ -416,7 +416,7 @@ fn a_huge_host_error_is_capped_in_the_stub() {
     let text = tool_content(&messages, "denied");
 
     assert!(
-        text.chars().count() <= 700,
+        text.chars().count() <= MAX_STUB_CHARS,
         "a 64 KiB host error must not inflate the stub: {} characters",
         text.chars().count()
     );
