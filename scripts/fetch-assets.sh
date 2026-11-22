@@ -7,6 +7,8 @@
 #   assets/checksums.txt
 #
 # It is gitignored; this script is the only supported way to populate it.
+#
+# Manifest verification is covered offline by tests/fetch_assets_test.sh.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,74 +54,101 @@ write_checksums() {
 
 # Verify every file already in the image against its checksums.txt entry. This
 # never rewrites the manifest, so a modified stdlib cannot be blessed by
-# re-running the script.
+# re-running the script. `root` defaults to `$ASSETS`; tests pass a temp image.
 verify_checksums() {
-    local manifest="$ASSETS/checksums.txt"
+    local root="${1:-$ASSETS}"
+    local manifest="$root/checksums.txt"
+    local entries=0 has_python=0
     local line hash path actual
     [[ -f "$manifest" ]] || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -z "$line" || "$line" == \#* ]] && continue
         hash="${line%%  *}"
         path="${line#*  }"
-        [[ -n "$hash" && -n "$path" && -f "$ASSETS/$path" ]] || return 1
-        actual="$(sha256 "$ASSETS/$path")" || return 1
+        [[ -n "$hash" && -n "$path" ]] || return 1
+        # Startup accepts only Normal path components: no absolute paths, no
+        # `..`, and no `.` (not even a leading `./`). Do not accept a manifest
+        # it would refuse.
+        [[ "$path" != /* ]] || return 1
+        case "/$path/" in
+            *"/./"* | *"/../"*) return 1 ;;
+        esac
+        [[ -f "$root/$path" ]] || return 1
+        actual="$(sha256 "$root/$path")" || return 1
         [[ "$actual" == "$hash" ]] || return 1
+        entries=$((entries + 1))
+        if [[ "$path" == "python.wasm" ]]; then
+            has_python=1
+        fi
     done <"$manifest"
+    # Startup rejects a manifest with no entries or no Guest entry, so it must
+    # not be accepted here either: accept it and the corrupt image is never
+    # refetched.
+    ((entries > 0)) || return 1
+    [[ "$has_python" -eq 1 ]] || return 1
 }
 
-if [[ -f "$ASSETS/python.wasm" && -d "$ASSETS/lib/python3.15" ]]; then
-    if [[ "$(sha256 "$ASSETS/python.wasm")" == "$PYTHON_SHA256" ]] && verify_checksums; then
-        printf 'fetch-assets: runtime image already present and verified (%s)\n' "$ASSETS"
-        exit 0
+main() {
+    if [[ -f "$ASSETS/python.wasm" && -d "$ASSETS/lib/python3.15" ]]; then
+        if [[ "$(sha256 "$ASSETS/python.wasm")" == "$PYTHON_SHA256" ]] &&
+            verify_checksums "$ASSETS"; then
+            printf 'fetch-assets: runtime image already present and verified (%s)\n' "$ASSETS"
+            exit 0
+        fi
+        printf 'fetch-assets: existing runtime image is corrupt; refetching\n' >&2
     fi
-    printf 'fetch-assets: existing runtime image is corrupt; refetching\n' >&2
-fi
 
-mkdir -p "$CACHE"
+    mkdir -p "$CACHE"
 
-ZIP="$CACHE/$ZIP_NAME"
-if [[ ! -f "$ZIP" ]] || [[ "$(sha256 "$ZIP")" != "$ZIP_SHA256" ]]; then
-    printf 'fetch-assets: downloading %s\n' "$ZIP_URL" >&2
-    partial="$ZIP.part"
-    rm -f "$partial"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fL --retry 3 --connect-timeout 30 -o "$partial" "$ZIP_URL" ||
-            fail "download failed: $ZIP_URL"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -O "$partial" "$ZIP_URL" || fail "download failed: $ZIP_URL"
+    ZIP="$CACHE/$ZIP_NAME"
+    if [[ ! -f "$ZIP" ]] || [[ "$(sha256 "$ZIP")" != "$ZIP_SHA256" ]]; then
+        printf 'fetch-assets: downloading %s\n' "$ZIP_URL" >&2
+        partial="$ZIP.part"
+        rm -f "$partial"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fL --retry 3 --connect-timeout 30 -o "$partial" "$ZIP_URL" ||
+                fail "download failed: $ZIP_URL"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -O "$partial" "$ZIP_URL" || fail "download failed: $ZIP_URL"
+        else
+            fail "need curl or wget to download the asset"
+        fi
+        mv "$partial" "$ZIP"
+    fi
+
+    actual_zip="$(sha256 "$ZIP")"
+    [[ "$actual_zip" == "$ZIP_SHA256" ]] ||
+        fail "SHA-256 mismatch for $ZIP: got $actual_zip, expected $ZIP_SHA256"
+
+    stage="$(mktemp -d "${TMPDIR:-/tmp}/dgr-assets.XXXXXX")"
+    cleanup_stage() { rm -rf "$stage"; }
+    trap cleanup_stage EXIT
+
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$ZIP" -d "$stage" || fail "failed to extract $ZIP"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -m zipfile -e "$ZIP" "$stage" || fail "failed to extract $ZIP"
     else
-        fail "need curl or wget to download the asset"
+        fail "need unzip or python3 to extract $ZIP"
     fi
-    mv "$partial" "$ZIP"
+
+    [[ -f "$stage/python.wasm" ]] || fail "archive is missing python.wasm"
+    [[ -d "$stage/lib/python3.15" ]] || fail "archive is missing lib/python3.15/"
+
+    actual_python="$(sha256 "$stage/python.wasm")"
+    [[ "$actual_python" == "$PYTHON_SHA256" ]] ||
+        fail "SHA-256 mismatch for extracted python.wasm: got $actual_python, expected $PYTHON_SHA256"
+
+    write_checksums "$stage"
+
+    rm -rf "$ASSETS"
+    mv "$stage" "$ASSETS"
+    trap - EXIT
+
+    printf 'fetch-assets: runtime image ready at %s\n' "$ASSETS"
+}
+
+# Sourced callers (tests) get the helpers without running the fetch.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-
-actual_zip="$(sha256 "$ZIP")"
-[[ "$actual_zip" == "$ZIP_SHA256" ]] ||
-    fail "SHA-256 mismatch for $ZIP: got $actual_zip, expected $ZIP_SHA256"
-
-stage="$(mktemp -d "${TMPDIR:-/tmp}/dgr-assets.XXXXXX")"
-cleanup() { rm -rf "$stage"; }
-trap cleanup EXIT
-
-if command -v unzip >/dev/null 2>&1; then
-    unzip -q "$ZIP" -d "$stage" || fail "failed to extract $ZIP"
-elif command -v python3 >/dev/null 2>&1; then
-    python3 -m zipfile -e "$ZIP" "$stage" || fail "failed to extract $ZIP"
-else
-    fail "need unzip or python3 to extract $ZIP"
-fi
-
-[[ -f "$stage/python.wasm" ]] || fail "archive is missing python.wasm"
-[[ -d "$stage/lib/python3.15" ]] || fail "archive is missing lib/python3.15/"
-
-actual_python="$(sha256 "$stage/python.wasm")"
-[[ "$actual_python" == "$PYTHON_SHA256" ]] ||
-    fail "SHA-256 mismatch for extracted python.wasm: got $actual_python, expected $PYTHON_SHA256"
-
-write_checksums "$stage"
-
-rm -rf "$ASSETS"
-mv "$stage" "$ASSETS"
-trap - EXIT
-
-printf 'fetch-assets: runtime image ready at %s\n' "$ASSETS"

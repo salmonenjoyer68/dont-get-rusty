@@ -1,12 +1,15 @@
 //! The Wasmtime Sandbox: runs the CPython Guest with a read-only Runtime Image.
 //!
-//! One [`Sandbox`] owns a single [`Engine`] and compiled [`Module`]; every Run
-//! gets a fresh [`Store`], so no state leaks between Runs.
+//! One [`Sandbox`] owns a single [`Engine`], its epoch-ticker thread, and the
+//! compiled [`Module`]; every Run gets a fresh [`Store`], so no state leaks
+//! between Runs.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -211,6 +214,9 @@ impl ResourceLimiter for MemoryLimiter {
 
 /// Owns the engine and the compiled Guest module shared by all Runs.
 pub struct Sandbox {
+    /// Holds the epoch ticker: dropping it stops and joins the thread, and it
+    /// is declared first so that happens before the engine is dropped.
+    _ticker: Ticker,
     engine: Engine,
     module: Module,
     runtime_image: PathBuf,
@@ -232,9 +238,10 @@ impl Sandbox {
     /// unusable cache directory is a [`SandboxError::Cache`], never a panic
     /// and never a silently uncached Sandbox.
     pub fn with_cfg(runtime_image: &Path, cfg: SandboxCfg) -> Result<Self, SandboxError> {
-        let engine = new_engine(cfg.cache_dir.as_deref())?;
+        let (engine, ticker) = new_engine(cfg.cache_dir.as_deref())?;
         let module = Module::from_file(&engine, runtime_image.join("python.wasm"))?;
         Ok(Self {
+            _ticker: ticker,
             engine,
             module,
             runtime_image: runtime_image.to_path_buf(),
@@ -364,7 +371,11 @@ impl Sandbox {
     }
 }
 
-fn new_engine(cache_dir: Option<&Path>) -> Result<Engine, SandboxError> {
+/// Builds the [`Engine`] and starts its epoch ticker.
+///
+/// The returned [`Ticker`] must stay alive while the engine is used for timed
+/// Runs; dropping it stops and joins the ticker thread.
+fn new_engine(cache_dir: Option<&Path>) -> Result<(Engine, Ticker), SandboxError> {
     let mut config = Config::new();
     config.epoch_interruption(true);
     if let Some(dir) = cache_dir {
@@ -381,18 +392,52 @@ fn new_engine(cache_dir: Option<&Path>) -> Result<Engine, SandboxError> {
         config.cache(Some(cache));
     }
     let engine = Engine::new(&config)?;
+    let ticker = Ticker::start(engine.clone())?;
 
-    let ticker = engine.clone();
-    std::thread::Builder::new()
-        .name("wasm-epoch".into())
-        .spawn(move || {
-            loop {
-                std::thread::sleep(TICK);
-                ticker.increment_epoch();
-            }
-        })?;
+    Ok((engine, ticker))
+}
 
-    Ok(engine)
+/// Owns the epoch-ticker thread that advances the engine's epoch.
+///
+/// The thread wakes every [`TICK`] to increment the epoch, which is how a
+/// Run's deadline traps a runaway Guest. Dropping the guard signals the loop
+/// and joins it, so neither a dropped [`Sandbox`] nor a construction that
+/// fails after the ticker starts leaves the thread (and its [`Engine`] clone)
+/// behind.
+struct Ticker {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Ticker {
+    fn start(engine: Engine) -> Result<Self, SandboxError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("wasm-epoch".into())
+            .spawn(move || {
+                while !signal.load(Ordering::Acquire) {
+                    std::thread::park_timeout(TICK);
+                    engine.increment_epoch();
+                }
+            })?;
+
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        thread.thread().unpark();
+        let _ = thread.join();
+    }
 }
 
 /// Decodes one captured stream and reports whether the capture limit dropped

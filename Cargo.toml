@@ -64,6 +64,9 @@ wasmtime = { version = "=50.0.1", default-features = false, features = [
 ] }
 wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p1"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

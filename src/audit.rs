@@ -1,4 +1,4 @@
-//! The append-only Audit Log: one JSON line per Tool Call.
+//! The Audit Log: one JSON line per Tool Call.
 //!
 //! Every Tool Call the Agent Loop handles — allowed, denied, malformed, or
 //! failed — appends exactly one [`AuditEvent`] to `<cwd>/.agent/audit.jsonl`.
@@ -16,6 +16,10 @@
 //! redacted too: it is model-supplied data crossing the boundary, not
 //! metadata.
 //!
+//! Each opened log is one session: it gets a fresh id, and every event it
+//! appends carries that id. The CLI opens one log per process; the Web Demo
+//! opens one per Task.
+//!
 //! `decision`/`denial_reason` are the Policy verdict alone: `deny` only when
 //! the Policy refused the call, with the reason. A Tool Call the Policy allowed
 //! but that failed on the host (quota, escape, overwrite decline, malformed
@@ -27,11 +31,29 @@
 //! Each event is one synchronous append followed by a flush, so a crash keeps
 //! every completed event and at worst loses the one in flight. A write failure
 //! is an error, never a silently dropped event.
+//!
+//! The log and its quarantine file must be regular files: a symlinked final
+//! component is refused rather than followed, even when the link currently
+//! resolves outside the Workspace, because following it would let a link
+//! redirect host-written audit records into the Workspace. A directory, FIFO,
+//! or device at either path is refused too: a FIFO would accept appends with
+//! nothing persisted, and the file tools must never block on it.
+//!
+//! Complete records are never rewritten or deleted, so the log is append-only
+//! except at open time. A write that fails halfway leaves part of a line at the
+//! end of the file; opening the log repairs that tail before anything is
+//! appended: a fragment that is a complete serialized event is terminated, and
+//! an incomplete one is moved to `<audit.jsonl>.quarantine`, so the next event
+//! always starts on its own line.
+//!
+//! Repair and every append take an exclusive lock on the log file. Without it,
+//! a second process opening the same damaged log could truncate the tail while
+//! this one appends, deleting an event that was already written.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -66,7 +88,8 @@ const REDACTED_FIELDS: [&str; 3] = ["code", "content", "stdin"];
 pub struct AuditEvent {
     /// RFC 3339 UTC timestamp of the host write.
     pub ts: String,
-    /// Id shared by every event of one process; generated once per process.
+    /// Id shared by every event written through one Audit Log; generated when
+    /// the log is opened.
     pub session: String,
     /// Step (LLM turn) that produced the Tool Call, zero-based.
     pub step: usize,
@@ -135,6 +158,7 @@ impl AuditEvent {
 #[derive(Debug)]
 pub struct AuditLog {
     path: PathBuf,
+    quarantine: PathBuf,
     session: String,
     file: Mutex<File>,
 }
@@ -147,8 +171,11 @@ impl AuditLog {
     /// first and the requested directory is made absolute lexically, so an
     /// inside-the-Workspace request is refused *before* `create_dir_all` touches
     /// the disk. After creation the directory is canonicalized again, so a
-    /// symlink that resolves into the Workspace is caught too. A refused start
-    /// leaves the Workspace exactly as it was.
+    /// symlink that resolves into the Workspace is caught too. The
+    /// `audit.jsonl` component itself must be a regular file: a symlinked log
+    /// is refused rather than followed, so it cannot resolve into the
+    /// Workspace after the directory check. A refused start leaves the
+    /// Workspace exactly as it was.
     pub fn open(cwd: &Path, workspace_root: &Path) -> Result<Self, AuditError> {
         let requested = cwd.join(DIR);
         let dir = std::path::absolute(&requested).map_err(|source| AuditError::Resolve {
@@ -196,20 +223,38 @@ impl AuditLog {
     /// Opens the log at `path`, appending to any existing file.
     ///
     /// The parent directory must exist; [`AuditLog::open`] creates `.agent/`
-    /// and enforces the outside-the-Workspace rule.
+    /// and enforces the outside-the-Workspace rule. The final log component and
+    /// a pre-existing quarantine file must both be regular files: a symlink is
+    /// refused rather than followed, even when it currently resolves outside
+    /// the Workspace, and a directory, FIFO, or device is refused too. A
+    /// symlinked quarantine is refused even when the log tail is clean, so a
+    /// later repair cannot be redirected. An unterminated final record left by
+    /// a failed append is repaired before the log is returned, so the next
+    /// event cannot merge into the fragment.
+    ///
+    /// Each handle gets a fresh session id: the events it writes are one
+    /// identifiable session even when another Audit Log opens in the same
+    /// process. The CLI opens one log per process, so its run stays one
+    /// session; the Web Demo opens one log per Task, so each Task gets its own.
     pub fn at(path: impl Into<PathBuf>) -> Result<Self, AuditError> {
         let path = path.into();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|source| AuditError::Open {
-                path: path.clone(),
-                source,
-            })?;
+        let quarantine = quarantine_path(&path);
+        // Validate the quarantine even on a clean log: it only gets opened
+        // during a later repair, and by then it is too late to refuse startup.
+        refuse_special(&quarantine)?;
+        let mut file = open_append_nofollow(&path)?;
+        // The repair reads the final record and then truncates it. An event
+        // appended in that window would be cut off with the fragment, so the
+        // lock is held across both steps and every append takes it too.
+        lock_exclusive(&file, &path)?;
+        let repaired = repair_unterminated_tail(&path, &quarantine, &mut file);
+        let released = unlock(&file, &path);
+        repaired?;
+        released?;
         Ok(Self {
+            quarantine,
             path,
-            session: SESSION.clone(),
+            session: new_session(),
             file: Mutex::new(file),
         })
     }
@@ -219,7 +264,13 @@ impl AuditLog {
         &self.path
     }
 
-    /// The id shared by every event of this process.
+    /// The file where an incomplete final record is preserved when the log is
+    /// opened. Complete records stay in the log.
+    pub fn quarantine_path(&self) -> &Path {
+        &self.quarantine
+    }
+
+    /// The id shared by every event this Audit Log writes.
     pub fn session(&self) -> &str {
         &self.session
     }
@@ -245,6 +296,9 @@ impl AuditLog {
     }
 
     /// Appends `event` as one JSON line and flushes it.
+    ///
+    /// The write holds the log lock, so a concurrent repair cannot truncate
+    /// the event when it cuts the damaged tail off.
     pub fn record_event(&self, event: &AuditEvent) -> Result<(), AuditError> {
         let mut line =
             serde_json::to_string(event).map_err(|source| AuditError::Encode { source })?;
@@ -253,20 +307,225 @@ impl AuditLog {
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        file.write_all(line.as_bytes())
+        lock_exclusive(&file, &self.path)?;
+        let written = file
+            .write_all(line.as_bytes())
             .and_then(|()| file.flush())
             .map_err(|source| AuditError::Write {
                 path: self.path.clone(),
                 source,
-            })
+            });
+        let released = unlock(&file, &self.path);
+        written?;
+        released
     }
 }
 
-/// The id shared by every event of one process.
+/// A fresh id for one Audit Log, shared by every event that log writes.
 ///
-/// A process handles one session, so the id is generated once and reused for
-/// every event.
-static SESSION: LazyLock<String> = LazyLock::new(|| format!("{:016x}", rand::random::<u64>()));
+/// Generated per handle, not per process: the CLI opens one log per process,
+/// so its events share one id, while the Web Demo opens one log per Task, so
+/// each Task gets a new id instead of reusing a session whose Step counter
+/// restarted at 0.
+fn new_session() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
+
+/// Opens `path` for appending after checking it is a regular file.
+///
+/// A symlink is refused even when it currently resolves outside the Workspace:
+/// the Audit Log is a regular file the process creates and owns, and following
+/// a link would reopen the path for redirection after the Workspace check. On
+/// Unix, `O_NOFOLLOW` closes the window between the metadata check and the
+/// open, and `O_NONBLOCK` keeps a FIFO swapped into that window from blocking
+/// the open. The opened handle's metadata is checked again, so a non-regular
+/// file that replaced the checked path is refused too.
+fn open_append_nofollow(path: &Path) -> Result<File, AuditError> {
+    refuse_special(path)?;
+    let file = append_options()
+        .read(true)
+        .open(path)
+        .map_err(|source| AuditError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| AuditError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(AuditError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(file)
+}
+
+/// Takes the exclusive lock on `file`, blocking until it is free.
+///
+/// The lock belongs to the open file description, so it excludes another
+/// process and another handle in this process (each handle opens its own
+/// description). Both critical sections are short — one append, or one tail
+/// read and truncation — and the kernel drops the lock when the handle is
+/// closed, so blocking cannot outlive a crashed peer.
+fn lock_exclusive(file: &File, path: &Path) -> Result<(), AuditError> {
+    file.lock().map_err(|source| AuditError::Lock {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Releases the lock [`lock_exclusive`] took.
+fn unlock(file: &File, path: &Path) -> Result<(), AuditError> {
+    file.unlock().map_err(|source| AuditError::Lock {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Open options shared by the log and its quarantine file: append, create, and
+/// never follow a symlinked final component.
+fn append_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    options
+}
+
+/// Refuses a path that is a symlink or not a regular file.
+///
+/// Resolving a link would let a host actor redirect host-written audit records
+/// somewhere they are not meant to go, including into the Workspace where the
+/// model can read them. Refusing every symlink keeps the rule independent of
+/// the link's current target. Directories, FIFOs, and devices are refused for
+/// the same reason plus one more: appending to a FIFO persists nothing, and a
+/// read would block. A missing path is fine: the log is created on open.
+fn refuse_special(path: &Path) -> Result<(), AuditError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(AuditError::Symlink {
+            path: path.to_path_buf(),
+        }),
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(AuditError::NotRegularFile {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AuditError::Open {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// The path where a fragment moved out of `path` is preserved.
+fn quarantine_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".quarantine");
+    PathBuf::from(name)
+}
+
+/// Makes sure a log whose last append failed halfway cannot merge the next
+/// event into the fragment.
+///
+/// A final record that is complete JSON but missing only its newline is
+/// terminated and kept. An incomplete fragment is appended to the quarantine
+/// file and then cut from the log; complete records are left byte for byte.
+fn repair_unterminated_tail(
+    path: &Path,
+    quarantine: &Path,
+    file: &mut File,
+) -> Result<(), AuditError> {
+    let Some((start, fragment)) = unterminated_tail(file).map_err(|source| AuditError::Repair {
+        path: path.to_path_buf(),
+        source,
+    })?
+    else {
+        return Ok(());
+    };
+
+    // A prefix of a serialized event that parses as a JSON object can only be
+    // the whole event missing its newline: any earlier cut would leave an
+    // unclosed string, array, or object.
+    let complete =
+        serde_json::from_slice::<serde_json::Value>(&fragment).is_ok_and(|value| value.is_object());
+    if complete {
+        return file
+            .write_all(b"\n")
+            .and_then(|()| file.flush())
+            .map_err(|source| AuditError::Repair {
+                path: path.to_path_buf(),
+                source,
+            });
+    }
+
+    // The quarantine file holds audit bytes too, so it is subject to the same
+    // regular-file rule as the log itself. [`AuditLog::at`] already checked it;
+    // this closes the window before the fragment is written.
+    refuse_special(quarantine)?;
+    let mut quarantined = open_append_nofollow(quarantine).map_err(|error| match error {
+        AuditError::Open { path, source } => AuditError::Repair { path, source },
+        other => other,
+    })?;
+    quarantined
+        .write_all(&fragment)
+        .and_then(|()| quarantined.write_all(b"\n"))
+        .and_then(|()| quarantined.flush())
+        .map_err(|source| AuditError::Repair {
+            path: quarantine.to_path_buf(),
+            source,
+        })?;
+    // Truncate only after the fragment is safely preserved.
+    file.set_len(start)
+        .and_then(|()| file.flush())
+        .map_err(|source| AuditError::Repair {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// The byte offset and bytes of a final record that lacks its newline.
+///
+/// Returns `None` when the file is empty or already ends with `\n`. The read
+/// starts at the last byte and walks backwards only until the previous newline,
+/// so a healthy log is not scanned.
+fn unterminated_tail(file: &mut File) -> io::Result<Option<(u64, Vec<u8>)>> {
+    const CHUNK: u64 = 8 * 1024;
+
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(None);
+    }
+
+    let mut tail = Vec::new();
+    let mut end = len;
+    loop {
+        let start = end.saturating_sub(CHUNK);
+        let mut chunk = vec![0u8; (end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk)?;
+        if let Some(newline) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            let mut fragment = chunk[newline + 1..].to_vec();
+            fragment.extend_from_slice(&tail);
+            return Ok(Some((start + newline as u64 + 1, fragment)));
+        }
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        if start == 0 {
+            return Ok(Some((0, tail)));
+        }
+        end = start;
+    }
+}
 
 /// The current time as RFC 3339 in UTC, e.g. `2026-11-03T12:00:00.123Z`.
 fn utc_now() -> String {
@@ -349,8 +608,24 @@ pub enum AuditError {
          the Workspace so the Guest and the model cannot read it"
     )]
     InsideWorkspace { path: PathBuf, workspace: PathBuf },
+    #[error(
+        "audit path `{path}` is a symlink; the Audit Log and its quarantine file must be regular \
+         files so they cannot redirect records into the Workspace"
+    )]
+    Symlink { path: PathBuf },
+    #[error(
+        "audit path `{path}` is not a regular file; the Audit Log and its quarantine file must be \
+         regular files so records are persisted and nothing can block or redirect them"
+    )]
+    NotRegularFile { path: PathBuf },
     #[error("failed to open audit log `{path}`")]
     Open {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to lock audit log `{path}`")]
+    Lock {
         path: PathBuf,
         #[source]
         source: io::Error,
@@ -366,4 +641,112 @@ pub enum AuditError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to repair an unterminated audit record in `{path}`")]
+    Repair {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Opens a second handle on `path` and takes the log lock, the way a
+    /// competing process does, so a test can prove an operation waits for it.
+    fn hold_lock(path: &Path) -> File {
+        let holder = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .expect("the test should open the log");
+        holder.lock().expect("the test should take the log lock");
+        holder
+    }
+
+    #[test]
+    fn opening_a_damaged_log_waits_for_the_log_lock() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(FILE);
+        std::fs::write(&path, "{\"complete\":true}\n{\"partial\"").expect("a damaged log");
+
+        let holder = hold_lock(&path);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            started_tx.send(()).expect("the test should be listening");
+            let log = AuditLog::at(&path);
+            let _ = opened_tx.send(());
+            log.map(|_| ())
+        });
+
+        started_rx.recv().expect("the opener should start");
+        assert!(
+            opened_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "opening must wait for the lock before it reads and truncates the tail"
+        );
+        holder
+            .unlock()
+            .expect("the test should release the log lock");
+        opened_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("opening should finish once the lock is free");
+        opener
+            .join()
+            .expect("the opener should not panic")
+            .expect("the log should open");
+    }
+
+    #[test]
+    fn appending_waits_for_the_log_lock() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(FILE);
+        std::fs::write(&path, "").expect("an empty log");
+        let log = AuditLog::at(&path).expect("the log should open");
+        let holder = hold_lock(&path);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (appended_tx, appended_rx) = mpsc::channel();
+        let appender = std::thread::spawn(move || {
+            started_tx.send(()).expect("the test should be listening");
+            let result = log.record(
+                0,
+                &ToolCall::new("call", "list_files", "{}".to_owned()),
+                &Decision::Allow,
+                &Observation::from_text("list_files", "README.md"),
+                1,
+            );
+            let _ = appended_tx.send(());
+            result
+        });
+
+        started_rx.recv().expect("the appender should start");
+        assert!(
+            appended_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "an append must wait for the lock a repair holds"
+        );
+        holder
+            .unlock()
+            .expect("the test should release the log lock");
+        appended_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the append should finish once the lock is free");
+        appender
+            .join()
+            .expect("the appender should not panic")
+            .expect("the event should be recorded");
+        let text = std::fs::read_to_string(&path).expect("the log should be readable");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "exactly one complete event: {text}"
+        );
+        assert!(text.ends_with('\n'), "the event ends its own line: {text}");
+    }
 }

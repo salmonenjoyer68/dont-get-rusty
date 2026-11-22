@@ -63,3 +63,7 @@ _Avoid_: config, permissions, guardrails
 **Audit Event**:
 A host-written record of one tool call, its policy decision, and its result.
 _Avoid_: log line, trace
+
+**Audit Session**:
+The id shared by every Audit Event written through one opened Audit Log. The CLI opens one per process, so a CLI run is one Audit Session; the Web Demo opens one per Task.
+_Avoid_: session, log session

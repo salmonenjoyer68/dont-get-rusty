@@ -7,8 +7,10 @@
 
 use std::collections::VecDeque;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
 
 use async_trait::async_trait;
 use dont_get_rusty::agent::{
@@ -140,6 +142,53 @@ fn an_allowed_and_a_denied_call_record_the_expected_fields() {
     assert_eq!(denied["stdout_bytes"], json!(0));
     assert_eq!(denied["stderr_bytes"], json!(0));
     assert_eq!(denied["truncated"], json!(false));
+}
+
+#[test]
+fn two_logs_opened_in_one_process_get_different_sessions() {
+    let first_cwd = TempDir::new().unwrap();
+    let second_cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+
+    let first =
+        AuditLog::open(first_cwd.path(), workspace.path()).expect("the first log should open");
+    let second =
+        AuditLog::open(second_cwd.path(), workspace.path()).expect("the second log should open");
+    assert_ne!(
+        first.session(),
+        second.session(),
+        "each Audit Log gets its own session id, even when both open in one process"
+    );
+
+    first
+        .record(
+            0,
+            &ToolCall::new("first", "list_files", "{}".to_owned()),
+            &Decision::Allow,
+            &Observation::from_text("list_files", "README.md"),
+            1,
+        )
+        .expect("the first event should be appended");
+    second
+        .record(
+            0,
+            &ToolCall::new("second", "list_files", "{}".to_owned()),
+            &Decision::Allow,
+            &Observation::from_text("list_files", "README.md"),
+            1,
+        )
+        .expect("the second event should be appended");
+
+    let first_events = events(first.path());
+    let second_events = events(second.path());
+    assert_eq!(first_events.len(), 1);
+    assert_eq!(second_events.len(), 1);
+    assert_eq!(first_events[0]["session"], json!(first.session()));
+    assert_eq!(second_events[0]["session"], json!(second.session()));
+    assert_ne!(
+        first_events[0]["session"], second_events[0]["session"],
+        "the events carry the id of the log that wrote them"
+    );
 }
 
 #[test]
@@ -299,6 +348,367 @@ fn a_log_inside_the_workspace_is_refused() {
     assert!(
         !dir.path().join(".agent").exists(),
         "a refused start must not create `.agent` in the Workspace"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_log_into_the_workspace_is_refused_and_leaves_its_target_untouched() {
+    use std::os::unix::fs::symlink;
+
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let agent_dir = cwd.path().join(".agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    let target = workspace.path().join("audit.jsonl");
+    let sentinel = "workspace file the model can read\n";
+    fs::write(&target, sentinel).unwrap();
+    symlink(&target, agent_dir.join("audit.jsonl")).unwrap();
+
+    let error = AuditLog::open(cwd.path(), workspace.path())
+        .expect_err("a log that resolves into the Workspace must be refused");
+
+    assert!(
+        matches!(error, AuditError::Symlink { .. }),
+        "the refusal names the symlink: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("symlink"),
+        "the error explains the problem: {error}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        sentinel,
+        "a refused start must not append audit records to the Workspace"
+    );
+    assert!(
+        agent_dir
+            .join("audit.jsonl")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a refused start must not replace the symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_log_outside_the_workspace_is_refused_too() {
+    use std::os::unix::fs::symlink;
+
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let agent_dir = cwd.path().join(".agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    let target = outside.path().join("audit.jsonl");
+    let sentinel = "audit records must not be redirected\n";
+    fs::write(&target, sentinel).unwrap();
+    symlink(&target, agent_dir.join("audit.jsonl")).unwrap();
+
+    let error = AuditLog::open(cwd.path(), workspace.path())
+        .expect_err("a symlinked log is refused even when it resolves outside the Workspace");
+
+    assert!(
+        matches!(error, AuditError::Symlink { .. }),
+        "the refusal names the symlink: {error:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        sentinel,
+        "the redirect target is untouched"
+    );
+    assert!(
+        !agent_dir.join("audit.jsonl.quarantine").exists(),
+        "no repair may run through the refused path"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_quarantine_file_is_refused_and_leaves_its_target_untouched() {
+    use std::os::unix::fs::symlink;
+
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    let path = log.path().to_path_buf();
+    let quarantine = log.quarantine_path().to_path_buf();
+    drop(log);
+
+    // A failed append leaves an incomplete record that opening the log repairs.
+    let fragment = "{\"ts\":\"2026-11-21T00:00:00Z\",\"session\":\"deadbeef";
+    fs::write(&path, fragment).expect("the partial log should be written");
+    let target = workspace.path().join("quarantine.txt");
+    let sentinel = "workspace file the model can read\n";
+    fs::write(&target, sentinel).unwrap();
+    symlink(&target, &quarantine).unwrap();
+
+    let error = AuditLog::open(cwd.path(), workspace.path())
+        .expect_err("a quarantine that resolves into the Workspace must be refused");
+
+    assert!(
+        matches!(error, AuditError::Symlink { ref path } if path == &quarantine),
+        "the refusal names the symlinked quarantine: {error:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        sentinel,
+        "the repair must not write the fragment into the Workspace"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        fragment,
+        "the repair must not cut the log before it knows the fragment is safe"
+    );
+}
+
+#[test]
+fn a_regular_log_still_opens_and_appends() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    let path = log.path().to_path_buf();
+    log.record(
+        0,
+        &ToolCall::new("first", "list_files", "{}".to_owned()),
+        &Decision::Allow,
+        &Observation::from_text("list_files", "README.md"),
+        1,
+    )
+    .expect("the first event should be appended");
+    drop(log);
+
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should reopen");
+    log.record(
+        0,
+        &ToolCall::new(
+            "second",
+            "read_file",
+            json!({ "path": "README.md" }).to_string(),
+        ),
+        &Decision::Allow,
+        &Observation::from_text("read_file", "hello"),
+        1,
+    )
+    .expect("the next event should be appended");
+
+    let events = events(&path);
+    assert_eq!(events.len(), 2, "regular logs keep appending across opens");
+    assert_eq!(events[0]["tool"], json!("list_files"));
+    assert_eq!(events[1]["tool"], json!("read_file"));
+    assert!(
+        !log.quarantine_path().exists(),
+        "a healthy regular log needs no repair"
+    );
+}
+
+#[test]
+fn a_partial_final_record_is_quarantined_before_the_next_append() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    log.record(
+        0,
+        &ToolCall::new("first", "list_files", "{}".to_owned()),
+        &Decision::Allow,
+        &Observation::from_text("list_files", "README.md"),
+        1,
+    )
+    .expect("an allowed event should be appended");
+    let path = log.path().to_path_buf();
+    let complete = fs::read_to_string(&path).expect("audit log should be readable");
+    assert_eq!(complete.lines().count(), 1);
+    drop(log);
+
+    // Simulate an append that wrote part of one JSON line and then failed: the
+    // fragment has no terminating newline, so appending the next event would
+    // otherwise merge the two into one unparseable line.
+    let fragment = "{\"ts\":\"2026-11-21T00:00:00Z\",\"session\":\"deadbeef";
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("audit log should append");
+    file.write_all(fragment.as_bytes())
+        .expect("the partial event should be written");
+    file.flush().expect("the partial event should be flushed");
+    drop(file);
+
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should reopen");
+    log.record(
+        0,
+        &ToolCall::new(
+            "second",
+            "read_file",
+            json!({ "path": "README.md" }).to_string(),
+        ),
+        &Decision::Allow,
+        &Observation::from_text("read_file", "hello from the workspace"),
+        1,
+    )
+    .expect("the next event should be appended");
+
+    let text = fs::read_to_string(log.path()).expect("audit log should stay readable");
+    assert!(
+        text.starts_with(&complete),
+        "complete records must not be rewritten: {text}"
+    );
+    let events = events(log.path());
+    assert_eq!(
+        events.len(),
+        2,
+        "the fragment must not swallow the next event: {text}"
+    );
+    assert_eq!(events[0]["tool"], json!("list_files"));
+    assert_eq!(
+        events[1]["tool"],
+        json!("read_file"),
+        "the new event is its own parseable line"
+    );
+
+    let quarantined = fs::read_to_string(log.quarantine_path())
+        .expect("the incomplete record should be preserved in the quarantine file");
+    assert_eq!(
+        quarantined,
+        format!("{fragment}\n"),
+        "the fragment is quarantined verbatim, on its own line"
+    );
+}
+
+#[test]
+fn an_unterminated_complete_record_is_terminated_and_kept() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    log.record(
+        0,
+        &ToolCall::new("first", "list_files", "{}".to_owned()),
+        &Decision::Allow,
+        &Observation::from_text("list_files", "README.md"),
+        1,
+    )
+    .expect("an allowed event should be appended");
+    let path = log.path().to_path_buf();
+    let complete = fs::read_to_string(&path).expect("audit log should be readable");
+    drop(log);
+
+    // A failed append can lose only the final newline while the event itself
+    // is complete: such a record is recoverable, not corrupt.
+    fs::write(&path, &complete[..complete.len() - 1]).expect("the newline should be dropped");
+
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should reopen");
+    assert!(
+        !log.quarantine_path().exists(),
+        "a complete record must not be quarantined"
+    );
+    assert_eq!(
+        fs::read_to_string(log.path()).expect("audit log should be readable"),
+        complete,
+        "the missing newline is restored and the record is kept"
+    );
+
+    log.record(
+        0,
+        &ToolCall::new(
+            "second",
+            "read_file",
+            json!({ "path": "README.md" }).to_string(),
+        ),
+        &Decision::Allow,
+        &Observation::from_text("read_file", "hello"),
+        1,
+    )
+    .expect("the next event should be appended");
+    assert_eq!(events(log.path()).len(), 2);
+}
+
+#[test]
+fn a_partial_record_larger_than_one_tail_read_is_still_quarantined() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let complete = "{\"tool\":\"list_files\"}\n";
+    let fragment = format!(
+        "{{\"ts\":\"2026-11-21T00:00:00Z\",\"padding\":\"{}\"",
+        "x".repeat(20 * 1024)
+    );
+    fs::write(&path, format!("{complete}{fragment}")).expect("the partial log should be written");
+
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should reopen");
+    assert_eq!(
+        fs::read_to_string(log.path()).expect("audit log should be readable"),
+        complete,
+        "the partial tail is cut and the complete record is kept"
+    );
+    assert_eq!(
+        fs::read_to_string(log.quarantine_path()).expect("quarantine should be readable"),
+        format!("{fragment}\n"),
+        "the whole partial record is preserved, not just the last chunk"
+    );
+}
+
+#[test]
+fn concurrent_opens_repair_the_tail_once_and_keep_every_appended_event() {
+    let cwd = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+    log.record(
+        0,
+        &ToolCall::new("first", "list_files", "{}".to_owned()),
+        &Decision::Allow,
+        &Observation::from_text("list_files", "README.md"),
+        1,
+    )
+    .expect("the first event should be appended");
+    let path = log.path().to_path_buf();
+    let quarantine = log.quarantine_path().to_path_buf();
+    drop(log);
+
+    let complete = fs::read_to_string(&path).expect("the log should be readable");
+    let fragment = "{\"ts\":\"2026-11-21T00:00:00Z\",\"tool\":\"read_fi";
+    fs::write(&path, format!("{complete}{fragment}")).expect("a failed append should be simulated");
+
+    // Each thread opens the same damaged log and appends one event. Repair
+    // reads the tail and then truncates it; without a lock covering both, an
+    // event appended between those steps is cut off with the fragment.
+    let threads: Vec<_> = (0..4)
+        .map(|step| {
+            let path = path.clone();
+            thread::spawn(move || {
+                let log = AuditLog::at(&path).expect("the damaged log should open");
+                log.record(
+                    step,
+                    &ToolCall::new(
+                        "later",
+                        "read_file",
+                        json!({ "path": "README.md" }).to_string(),
+                    ),
+                    &Decision::Allow,
+                    &Observation::from_text("read_file", "hello"),
+                    1,
+                )
+                .expect("the event should be appended");
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("no thread should panic");
+    }
+
+    let events = events(&path);
+    assert_eq!(
+        events.len(),
+        5,
+        "every event survives the repair race: {events:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&quarantine).expect("the quarantine should be readable"),
+        format!("{fragment}\n"),
+        "the fragment is quarantined exactly once, not once per opener"
     );
 }
 
@@ -538,4 +948,161 @@ async fn a_declined_overwrite_keeps_the_policy_allow_and_records_an_error() {
         failing.get("error").is_none(),
         "a completed Guest Run with a non-zero exit records no host error"
     );
+}
+
+#[cfg(unix)]
+mod special_files {
+    use super::*;
+    use std::os::unix::fs::FileTypeExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Creates a FIFO with the platform `mkfifo` command.
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("`mkfifo` should be available on this platform");
+        assert!(status.success(), "mkfifo failed with {status}");
+    }
+
+    #[test]
+    fn a_fifo_log_is_refused_without_blocking() {
+        let cwd = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let agent_dir = cwd.path().join(".agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let fifo = agent_dir.join("audit.jsonl");
+        make_fifo(&fifo);
+
+        // Opening a FIFO used to succeed (or block, depending on the flags), so
+        // records could be swallowed with nothing persisted. Run the open on a
+        // worker so a regression fails here instead of hanging the suite.
+        let cwd_path = cwd.path().to_path_buf();
+        let workspace_path = workspace.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                AuditLog::open(&cwd_path, &workspace_path).map(|log| log.path().to_path_buf());
+            let _ = sender.send(result);
+        });
+
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(Err(error)) => {
+                assert!(
+                    error.to_string().contains("regular file"),
+                    "the refusal must explain that the log must be a regular file: {error}"
+                );
+                assert!(
+                    !matches!(error, AuditError::Symlink { .. }),
+                    "a FIFO is not a symlink: {error:?}"
+                );
+            }
+            Ok(Ok(path)) => panic!("a FIFO log must be refused, but it opened at {path:?}"),
+            Err(_) => panic!("opening a FIFO log blocked instead of refusing it"),
+        }
+        assert!(
+            fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+            "a refused start must not replace the FIFO"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_quarantine_file_with_a_clean_tail_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+        log.record(
+            0,
+            &ToolCall::new("first", "list_files", "{}".to_owned()),
+            &Decision::Allow,
+            &Observation::from_text("list_files", "README.md"),
+            1,
+        )
+        .expect("an allowed event should be appended");
+        let path = log.path().to_path_buf();
+        let quarantine = log.quarantine_path().to_path_buf();
+        let clean = fs::read_to_string(&path).expect("audit log should be readable");
+        drop(log);
+        assert!(
+            clean.ends_with('\n'),
+            "the log tail is clean, so no repair is due"
+        );
+
+        let target = workspace.path().join("quarantine.txt");
+        let sentinel = "workspace file the model can read\n";
+        fs::write(&target, sentinel).unwrap();
+        symlink(&target, &quarantine).unwrap();
+
+        let error = AuditLog::open(cwd.path(), workspace.path())
+            .expect_err("a symlinked quarantine must be refused even when the log tail is clean");
+
+        assert!(
+            matches!(error, AuditError::Symlink { ref path } if path == &quarantine),
+            "the refusal names the symlinked quarantine: {error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            sentinel,
+            "a refused start must not write through the quarantine link"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            clean,
+            "a refused start must not touch the clean log"
+        );
+    }
+
+    #[test]
+    fn a_fifo_quarantine_file_is_refused_without_blocking() {
+        let cwd = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let log = AuditLog::open(cwd.path(), workspace.path()).expect("audit log should open");
+        log.record(
+            0,
+            &ToolCall::new("first", "list_files", "{}".to_owned()),
+            &Decision::Allow,
+            &Observation::from_text("list_files", "README.md"),
+            1,
+        )
+        .expect("an allowed event should be appended");
+        let quarantine = log.quarantine_path().to_path_buf();
+        drop(log);
+        make_fifo(&quarantine);
+
+        let cwd_path = cwd.path().to_path_buf();
+        let workspace_path = workspace.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                AuditLog::open(&cwd_path, &workspace_path).map(|log| log.path().to_path_buf());
+            let _ = sender.send(result);
+        });
+
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(Err(error)) => {
+                assert!(
+                    error.to_string().contains("regular file"),
+                    "the refusal must explain that the quarantine must be a regular file: {error}"
+                );
+                assert!(
+                    !matches!(error, AuditError::Symlink { .. }),
+                    "a FIFO is not a symlink: {error:?}"
+                );
+            }
+            Ok(Ok(path)) => panic!(
+                "a FIFO quarantine must be refused even on a clean tail, but the log opened at {path:?}"
+            ),
+            Err(_) => panic!("opening a FIFO quarantine blocked instead of refusing it"),
+        }
+        assert!(
+            fs::symlink_metadata(&quarantine)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "a refused start must not replace the FIFO"
+        );
+    }
 }

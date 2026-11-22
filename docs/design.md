@@ -212,10 +212,10 @@ Non-streaming: one `/v1/chat/completions` request per Step, `tools` built from t
 `dont-get-rusty-web` (cargo feature `web`) serves the same Agent Loop to a localhost page. Scope is fixed by `docs/adr/0003-web-demo-scope.md`: loopback only, no auth, no CORS, one Task at a time.
 
 ```sh
-cargo run --features web --bin dont-get-rusty-web [--workspace DIR] [--policy FILE] [--port 7878]
+cargo run --features web --bin dont-get-rusty-web -- [--workspace DIR] [--policy FILE] [--port 7878]
 ```
 
-Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log session) over the shared `Sandbox` and `Chat`. A second submission while one runs gets `409`. There is no cancel button: a Task ends at its answer, its Step limit, or a dropped connection only when it reaches one.
+Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log with its own session id) over the shared `Sandbox` and `Chat`. A second submission while one runs gets `409`. There is no cancel button: a Task ends at its answer, its Step limit, or a dropped connection only when it reaches one.
 
 | Route | Meaning |
 |---|---|
@@ -228,7 +228,9 @@ Each Task builds a fresh `Agent` (fresh Workspace handle, fresh Audit Log sessio
 | `GET /api/workspace/file?path=` | Read-only file view, capped at 64 KiB |
 | `GET /api/audit` | Last 200 Audit Events |
 
-The SSE stream is driven by a `Notify`-woken replay loop, not a broadcast channel: events are retained per Task, so a reconnect or a page loaded mid-Task replays from index 0 and cannot lose or reorder events. The cursor resets when a new Task clears the transcript.
+Every request passes a Host check before routing: a missing or non-loopback `Host` (`127.0.0.1` or `localhost`, optional numeric port) gets `400`. A state-changing request carrying a present, non-loopback `Origin` gets `403`; a missing `Origin` and same-origin page/SSE requests are served normally. This closes the DNS-rebinding path where an attacker page keeps its own Host and Origin while its hostname resolves to loopback.
+
+The SSE stream is driven by a `watch` generation counter, not a single-waiter `Notify`: each stream subscribes before reading the transcript, so a change landing between the read and the wait still wakes it, and every open tab wakes instead of racing for one wakeup. Events are retained per Task, so a reconnect or a page loaded mid-Task replays from index 0 and cannot lose or reorder events. The cursor resets when a new Task clears the transcript.
 
 Confirmations reuse the core's synchronous prompts: the Web Demo blocks the Agent's worker thread (`tokio::task::block_in_place`) on a channel until the page answers, with a 10-minute timeout answered `deny`. Every Step, Tool Call, and Observation is sent to the browser with its arguments and captured output; the Audit Log stays redacted.
 
@@ -257,19 +259,23 @@ model = "qwen3.5:4b"  # upgrade: qwen2.5-coder:7b after `ollama pull`
 request_timeout_s = 120
 ```
 
-`max_total_mb` is enforced before each `write_file` by summing workspace file sizes; a write that would exceed it is denied.
+`max_total_mb` is enforced before each `write_file` by summing workspace file sizes; a write that would exceed it is denied. A write is also refused before creating anything when its parent path would nest deeper than the 64-level size scan can walk, counting in-workspace symlinked ancestors at their resolved depth. `read_file` opens regular files only (or in-workspace symlinks to one): directories, FIFOs, and devices are rejected as non-files before the open, so a FIFO cannot block the agent.
 
 Every value has a documented default, so a partial file is valid. `--policy <file>` must name an existing file; without it `./policy.toml` is loaded when present, otherwise the built-in defaults apply. Unknown keys are rejected so a typo cannot silently fall back to a weaker default. The Policy file must live outside the Workspace (startup refuses otherwise) so the model can neither read nor modify it. `network = true` is rejected: v1 grants the Guest no network capability.
 
 ## Audit
 
-Append-only JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Guest cannot read it. One event per Tool Call:
+JSONL at `<cwd>/.agent/audit.jsonl`, outside `[fs].root` so the Guest cannot read it. It is append-only except for the open-time repair of an unterminated final fragment described below. The log and its `.quarantine` companion must be regular files: a symlink, directory, FIFO, or device is refused at startup rather than opened, even when a symlink resolves outside the Workspace, so a link cannot redirect records into it and a FIFO cannot swallow them. One event per Tool Call:
 
 ```json
 {"ts":"2026-11-03T12:00:00Z","session":"…","step":3,"tool":"write_file","args_sha256":"…","args_prefix":"…","decision":"allow","error":"workspace quota exceeded: …","exit_code":null,"stdout_bytes":0,"stderr_bytes":0,"truncated":false,"duration_ms":4}
 ```
 
 Args are truncated to 2 KiB plus a SHA-256 of the full payload; code, file contents, and piped `stdin` are never stored.
+
+The `session` id identifies one Audit Log handle: it is generated when the log is opened, and every event written through that handle carries it. The CLI opens one log per process, so a CLI run stays one session; the Web Demo opens one log per Task, so each Task records a new session id while its `step` counter restarts at 0.
+
+A failed append can leave an unterminated final record. Opening the log validates that tail first: a complete event missing only its newline is terminated, and an incomplete fragment is moved to `audit.jsonl.quarantine` before the next event is written. Bytes belonging to complete records are never rewritten.
 
 `decision`/`denial_reason` are the Policy verdict only: `deny` with a reason for a Policy refusal, `allow` otherwise. A call the Policy allowed but that failed on the host (quota, escape, overwrite decline, malformed arguments, Sandbox setup) stays `allow` and records the host-side message in the optional `error` field; a Policy denial has `denial_reason` and no `error`. A Guest Run records `allow` even when its exit code is non-zero: the Guest ran, and the exit code is the result. Output byte counts are totals produced before truncation.
 

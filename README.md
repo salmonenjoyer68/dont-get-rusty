@@ -61,7 +61,7 @@ pipeline never hangs.
 The same Agent Loop behind a localhost browser page:
 
 ```sh
-cargo run --features web --bin dont-get-rusty-web
+cargo run --features web --bin dont-get-rusty-web -- [--workspace DIR] [--policy FILE] [--port 7878]
 ```
 
 It serves `http://127.0.0.1:7878` (loopback only, no authentication, no CORS)
@@ -80,9 +80,13 @@ attempt, a 10 s timeout, a 300 MB allocation, and a Workspace read.
 
 Deliberate limits: one Task at a time (a second submission gets `409`), no
 cancel button, and no public deployment story — the demo inherits the CLI's
-trust model. See `docs/adr/0003-web-demo-scope.md`. The page is plain
-HTML/CSS/ES modules embedded in the binary, so there is no npm step; editing
-`web/` requires a rebuild.
+trust model. Before routing, every request must name a loopback `Host` (a
+missing or foreign Host gets `400`), and a state-changing request with a
+present, non-loopback `Origin` is refused (`403`). Same-origin page and event
+stream requests keep working; the check stops a DNS-rebinding page from reading
+the Workspace or driving the agent. See `docs/adr/0003-web-demo-scope.md`. The
+page is plain HTML/CSS/ES modules embedded in the binary, so there is no npm
+step; editing `web/` requires a rebuild.
 
 ## Policy
 
@@ -108,7 +112,12 @@ would exceed it creates and truncates nothing.
   processes, and no writable paths.
 - Guest writes fail with `PermissionError`; `write_file` is the only durable
   write path, and it goes through `cap-std`, which denies `..`, absolute paths,
-  and symlinks that leave the Workspace.
+  and symlinks that leave the Workspace. A write whose parent path would nest
+  deeper than 64 directories is refused before anything is created, counting
+  in-workspace symlinked ancestors at their resolved real depth.
+- `read_file` opens regular files only (or in-workspace symlinks to one):
+  directories, FIFOs, and devices are refused as non-files before the open, so
+  a FIFO cannot block the agent.
 - Every Run gets a fresh `Store`. Limits: 10 s wall-clock epoch deadline
   (exit 124, `timed_out`), 256 MB per linear memory (exit 137), 64 KB retained
   per output stream (the rest is drained, counted, and reported with a
@@ -124,10 +133,20 @@ would exceed it creates and truncates nothing.
 
 Every Tool Call appends exactly one JSON line to `<cwd>/.agent/audit.jsonl`,
 which lives outside the Workspace so neither the Guest nor the model can read
-it. An event records the timestamp, session id, Step, tool, a SHA-256 of the
-full arguments, the redacted argument prefix, the decision, exit code, output
-byte counts, truncation flag, and duration. `code`, `content`, and `stdin` are
-replaced by `<omitted: N bytes>` markers, so bodies never reach the log.
+it. The log (and its `.quarantine` companion) must be a regular file: startup
+refuses a symlink, directory, FIFO, or device rather than opening it. A symlink
+could redirect audit records into the Workspace, and a FIFO would accept
+appends with nothing persisted. An event records the timestamp, session id,
+Step, tool, a SHA-256 of the full arguments, the redacted argument prefix, the
+decision, exit code, output byte counts, truncation flag, and duration. `code`,
+`content`, and `stdin` are replaced by `<omitted: N bytes>` markers, so bodies
+never reach the log.
+
+An append that fails halfway can leave an unterminated final record. The log is
+append-only except at open time, when that tail is validated: a complete event
+missing only its newline is terminated, and an incomplete fragment is moved to
+`<cwd>/.agent/audit.jsonl.quarantine` before the next event is written, so one
+event never merges into another. Complete records are never rewritten.
 
 `decision`/`denial_reason` are the Policy verdict only. A call the Policy
 allowed but that failed on the host (quota, escape, overwrite decline,
@@ -140,17 +159,27 @@ Output byte counts are totals produced before truncation.
 
 ```sh
 scripts/fetch-assets.sh          # once, needs network
+bash tests/fetch_assets_test.sh  # offline; fetch script manifest verification
 cargo test --offline             # ~3 minutes; the real CPython Guest runs
 cargo test --offline --features web   # adds the Web Demo routes
+node --test web/app.test.mjs     # browser tests: browsing, Confirmations, event-stream resilience (Node built-ins only)
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+`tests/fetch_assets_test.sh` drives the fetch script's `checksums.txt`
+verification and refetch decision against temporary fake images with a stub
+`curl`, so it needs neither network nor a fetched `assets/` directory.
+
 The suite includes a consolidated escape suite against the real Guest
 (`tests/escape.rs`), an end-to-end CLI test that spawns the binary against a
 dependency-free stub OpenAI server on loopback (`tests/e2e.rs`), and the
-compiled-module cache tests (`tests/cache.rs`). No test contacts Ollama or any
-host beyond `127.0.0.1`.
+compiled-module cache tests (`tests/cache.rs`). `tests/thread_count.rs` is
+Linux-only and uses a deliberately empty wasm module: it observes
+`/proc/self/task`, and the ticker's lifetime does not depend on real Guest
+bytes. No test contacts Ollama or any host beyond `127.0.0.1`. The Web Demo
+tests drive the real `web/app.js` through a minimal DOM and `fetch` stub, so
+they need only Node's built-in test runner and no npm install.
 
 After the one-time asset fetch (and the initial Cargo dependency download), the
 agent works offline: the only network dependency at runtime is your local model
