@@ -34,3 +34,6 @@ id_ed25519*
 .idea/
 .vscode/
 .DS_Store
+
+# Local code review artifact
+/code-review.html
